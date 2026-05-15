@@ -1,10 +1,8 @@
 import {
-	ICredentialDataDecryptedObject,
 	INodeType,
 	INodeTypeDescription,
 	ITriggerFunctions,
 	ITriggerResponse,
-	NodeApiError,
 	NodeOperationError,
 } from 'n8n-workflow';
 
@@ -17,52 +15,74 @@ export class WebsocketTrigger implements INodeType {
 		icon: 'file:websocket.svg',
 		group: ['trigger'],
 		version: 1,
-		description: 'Connect to ws endpoint and trigger flow on incoming message, open or close. Supports Bearer token credentials with auto-reconnect.',
+		description: 'Connect to ws endpoint and trigger flow on incoming message, open or close. Supports header/query auth and auto-reconnect.',
 		defaults: {
 			name: 'Websocket Connection & Message',
 		},
 		inputs: [],
 		outputs: ['main'],
-		credentials: [
-			{
-				name: 'websocketHeaderAuthApi',
-				required: false,
-				displayOptions: {
-					show: {
-						authentication: ['headerAuth'],
-					},
-				},
-			},
-			{
-				name: 'websocketQueryAuthApi',
-				required: false,
-				displayOptions: {
-					show: {
-						authentication: ['queryAuth'],
-					},
-				},
-			},
-		],
 		properties: [
-			{
-				displayName: 'Authentication',
-				name: 'authentication',
-				type: 'options',
-				options: [
-					{ name: 'None', value: 'none' },
-					{ name: 'Header Auth (Bearer / API Key)', value: 'headerAuth' },
-					{ name: 'Query Parameter Auth', value: 'queryAuth' },
-				],
-				default: 'none',
-				description: 'Authentication method to use when connecting to the WebSocket server',
-			},
 			{
 				displayName: 'Websocket URL',
 				name: 'websocketUrl',
 				type: 'string',
 				default: '',
 				placeholder: 'wss://example.com/ws',
-				description: 'URL of the WebSocket server. Do NOT include auth tokens here — use the Authentication field above.',
+				description: 'URL of the WebSocket server',
+			},
+			{
+				displayName: 'Authentication',
+				name: 'authentication',
+				type: 'options',
+				options: [
+					{ name: 'None', value: 'none' },
+					{ name: 'Header (Bearer / API Key)', value: 'headerAuth' },
+					{ name: 'Query Parameter', value: 'queryAuth' },
+				],
+				default: 'none',
+				description: 'Authentication method',
+			},
+			{
+				displayName: 'Header Name',
+				name: 'headerName',
+				type: 'string',
+				default: 'Authorization',
+				displayOptions: {
+					show: { authentication: ['headerAuth'] },
+				},
+				description: 'Name of the HTTP header (e.g. Authorization)',
+			},
+			{
+				displayName: 'Header Value',
+				name: 'headerValue',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				displayOptions: {
+					show: { authentication: ['headerAuth'] },
+				},
+				description: 'Value of the header (e.g. Bearer mytoken)',
+			},
+			{
+				displayName: 'Query Param Name',
+				name: 'queryParamName',
+				type: 'string',
+				default: 'token',
+				displayOptions: {
+					show: { authentication: ['queryAuth'] },
+				},
+				description: 'Name of the query parameter',
+			},
+			{
+				displayName: 'Query Param Value',
+				name: 'queryParamValue',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				displayOptions: {
+					show: { authentication: ['queryAuth'] },
+				},
+				description: 'Value of the query parameter',
 			},
 			{
 				displayName: 'Auto Reconnect',
@@ -89,14 +109,14 @@ export class WebsocketTrigger implements INodeType {
 				displayOptions: {
 					show: { autoReconnect: [true] },
 				},
-				description: 'Maximum number of reconnection attempts. 0 = unlimited.',
+				description: 'Maximum reconnection attempts. 0 = unlimited.',
 			},
 			{
 				displayName: 'Send Initial Message',
 				name: 'sendInitMessage',
 				type: 'boolean',
 				default: false,
-				description: 'Whether to send a message to the server immediately upon connecting',
+				description: 'Whether to send a message immediately upon connecting',
 			},
 			{
 				displayName: 'Initial Message',
@@ -132,21 +152,19 @@ export class WebsocketTrigger implements INodeType {
 		const reconnectInterval = (this.getNodeParameter('reconnectInterval') as number) * 1000;
 		const maxReconnects     = this.getNodeParameter('maxReconnectAttempts') as number;
 
-		const buildConnectionOptions = async (): Promise<{ url: string; headers: Record<string, string> }> => {
+		const buildConnectionOptions = (): { url: string; headers: Record<string, string> } => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
 
 			if (authentication === 'headerAuth') {
-				const creds = await this.getCredentials('websocketHeaderAuthApi') as ICredentialDataDecryptedObject;
-				const headerName  = (creds.name  as string) || 'Authorization';
-				const headerValue = (creds.value as string) || '';
+				const headerName  = this.getNodeParameter('headerName') as string || 'Authorization';
+				const headerValue = this.getNodeParameter('headerValue') as string || '';
 				headers[headerName] = headerValue;
 			}
 
 			if (authentication === 'queryAuth') {
-				const creds = await this.getCredentials('websocketQueryAuthApi') as ICredentialDataDecryptedObject;
-				const paramName  = (creds.name  as string) || 'token';
-				const paramValue = (creds.value as string) || '';
+				const paramName  = this.getNodeParameter('queryParamName') as string || 'token';
+				const paramValue = this.getNodeParameter('queryParamValue') as string || '';
 				const separator = url.includes('?') ? '&' : '?';
 				url = `${url}${separator}${encodeURIComponent(paramName)}=${encodeURIComponent(paramValue)}`;
 			}
@@ -156,20 +174,15 @@ export class WebsocketTrigger implements INodeType {
 
 		const startConsumer = async (): Promise<void> => {
 			try {
-				const { url, headers } = await buildConnectionOptions();
+				const { url, headers } = buildConnectionOptions();
 
 				ws = new WebSocket(url, { headers });
 
 				ws.on('error', (error: Error) => {
 					console.warn('[websocket-ws] connection error:', error.message);
-					const errorData = {
-						message: 'WebSocket connection error',
-						description: error.message,
-					};
 					this.emit([
 						this.helpers.returnJsonArray([{ event: 'error', message: error.message }]),
 					]);
-					throw new NodeApiError(this.getNode(), errorData);
 				});
 
 				ws.on('close', () => {

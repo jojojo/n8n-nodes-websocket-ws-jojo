@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-websocket-ws-reconnect",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Websocket (ws) trigger for n8n with auth (Bearer/query) and auto-reconnect support",
   "keywords": [
     "n8n-community-node-package"
@@ -34,16 +34,13 @@
   ],
   "n8n": {
     "n8nNodesApiVersion": 1,
-    "credentials": [
-      "dist/credentials/WebsocketHeaderAuth.credentials.js",
-      "dist/credentials/WebsocketQueryAuth.credentials.js"
-    ],
     "nodes": [
       "dist/nodes/Websocket/WebsocketReconnect.node.js",
       "dist/nodes/Websocket/WebsocketReconnectTrigger.node.js"
     ]
   },
   "devDependencies": {
+    "@types/ws": "^8.5.13",
     "@typescript-eslint/parser": "^7.15.0",
     "eslint": "^8.56.0",
     "eslint-plugin-n8n-nodes-base": "^1.16.1",
@@ -56,7 +53,6 @@
     "n8n-workflow": "*"
   },
   "dependencies": {
-    "@types/ws": "^8.5.13",
     "ws": "^8.18.0"
   }
 }
