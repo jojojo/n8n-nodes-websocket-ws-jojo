@@ -1,4 +1,5 @@
 import {
+	ICredentialDataDecryptedObject,
 	INodeType,
 	INodeTypeDescription,
 	ITriggerFunctions,
@@ -16,93 +17,191 @@ export class WebsocketTrigger implements INodeType {
 		icon: 'file:websocket.svg',
 		group: ['trigger'],
 		version: 1,
-		description: 'Connect to ws endpoint and trigger flow both on incoming message or websocket opening/closing',
+		description: 'Connect to ws endpoint and trigger flow on incoming message, open or close. Supports Bearer token credentials with auto-reconnect.',
 		defaults: {
 			name: 'Websocket Connection & Message',
 		},
 		inputs: [],
 		outputs: ['main'],
+		credentials: [
+			{
+				name: 'httpHeaderAuth',
+				required: false,
+				displayOptions: {
+					show: {
+						authentication: ['headerAuth'],
+					},
+				},
+			},
+			{
+				name: 'httpQueryAuth',
+				required: false,
+				displayOptions: {
+					show: {
+						authentication: ['queryAuth'],
+					},
+				},
+			},
+		],
 		properties: [
+			{
+				displayName: 'Authentication',
+				name: 'authentication',
+				type: 'options',
+				options: [
+					{ name: 'None', value: 'none' },
+					{ name: 'Header Auth (Bearer / API Key)', value: 'headerAuth' },
+					{ name: 'Query Parameter Auth', value: 'queryAuth' },
+				],
+				default: 'none',
+				description: 'Authentication method to use when connecting to the WebSocket server',
+			},
 			{
 				displayName: 'Websocket URL',
 				name: 'websocketUrl',
 				type: 'string',
 				default: '',
-				placeholder: 'wss://example.com/',
-				description: 'URL of the websocket server to connect to',
+				placeholder: 'wss://example.com/ws',
+				description: 'URL of the WebSocket server. Do NOT include auth tokens here — use the Authentication field above.',
 			},
 			{
-				displayName: 'Return WS Resource',
-				name: 'returnWs',
+				displayName: 'Auto Reconnect',
+				name: 'autoReconnect',
 				type: 'boolean',
-				default: false,
-				description: 'Whether to return ws resource. If you want to send back messages, this is required. However, your browser might freeze for a moment while displaying it in execution mode.',
+				default: true,
+				description: 'Whether to automatically reconnect if the connection drops',
+			},
+			{
+				displayName: 'Reconnect Interval (seconds)',
+				name: 'reconnectInterval',
+				type: 'number',
+				default: 10,
+				displayOptions: {
+					show: { autoReconnect: [true] },
+				},
+				description: 'Seconds to wait before attempting reconnection',
+			},
+			{
+				displayName: 'Max Reconnect Attempts',
+				name: 'maxReconnectAttempts',
+				type: 'number',
+				default: 0,
+				displayOptions: {
+					show: { autoReconnect: [true] },
+				},
+				description: 'Maximum number of reconnection attempts. 0 = unlimited.',
 			},
 			{
 				displayName: 'Send Initial Message',
 				name: 'sendInitMessage',
 				type: 'boolean',
 				default: false,
-				description: 'Whether to send message to server immediately upon connecting',
+				description: 'Whether to send a message to the server immediately upon connecting',
 			},
 			{
 				displayName: 'Initial Message',
 				name: 'initMessage',
 				type: 'string',
 				displayOptions: {
-					show: {
-						sendInitMessage: [true],
-					},
+					show: { sendInitMessage: [true] },
 				},
 				required: true,
 				default: '{}',
-				description: 'Message to send',
+				description: 'Message to send upon connecting',
+			},
+			{
+				displayName: 'Return WS Resource',
+				name: 'returnWs',
+				type: 'boolean',
+				default: false,
+				description: 'Whether to return the ws resource (needed to send messages back)',
 			},
 		],
 	};
 
 	async trigger(this: ITriggerFunctions): Promise<ITriggerResponse> {
-		let ws: any = null;
+		let ws: WebSocket | null = null;
+		let reconnectAttempts = 0;
+		let isClosed = false;
 
-		let websocketUrl: string;
-		let sendInitMessage: boolean;
-		let returnWs: boolean;
-		let initMessage : string;
+		const websocketUrl      = this.getNodeParameter('websocketUrl') as string;
+		const authentication    = this.getNodeParameter('authentication') as string;
+		const sendInitMessage   = this.getNodeParameter('sendInitMessage') as boolean;
+		const returnWs          = this.getNodeParameter('returnWs') as boolean;
+		const autoReconnect     = this.getNodeParameter('autoReconnect') as boolean;
+		const reconnectInterval = (this.getNodeParameter('reconnectInterval') as number) * 1000;
+		const maxReconnects     = this.getNodeParameter('maxReconnectAttempts') as number;
 
-		const startConsumer = async () => {
+		const buildConnectionOptions = async (): Promise<{ url: string; headers: Record<string, string> }> => {
+			let url = websocketUrl;
+			const headers: Record<string, string> = {};
+
+			if (authentication === 'headerAuth') {
+				const creds = await this.getCredentials('httpHeaderAuth') as ICredentialDataDecryptedObject;
+				const headerName  = (creds.name  as string) || 'Authorization';
+				const headerValue = (creds.value as string) || '';
+				headers[headerName] = headerValue;
+			}
+
+			if (authentication === 'queryAuth') {
+				const creds = await this.getCredentials('httpQueryAuth') as ICredentialDataDecryptedObject;
+				const paramName  = (creds.name  as string) || 'token';
+				const paramValue = (creds.value as string) || '';
+				const separator = url.includes('?') ? '&' : '?';
+				url = `${url}${separator}${encodeURIComponent(paramName)}=${encodeURIComponent(paramValue)}`;
+			}
+
+			return { url, headers };
+		};
+
+		const startConsumer = async (): Promise<void> => {
 			try {
-				websocketUrl = this.getNodeParameter('websocketUrl') as string;
-				sendInitMessage = (this.getNodeParameter('sendInitMessage') || false) as boolean;
-				returnWs = (this.getNodeParameter('returnWs') || false) as boolean;
-				ws = new WebSocket(websocketUrl);
+				const { url, headers } = await buildConnectionOptions();
 
-				ws.on('error', (error: {message: any;}) => {
-					console.warn('[websocket-ws] connection error');
+				ws = new WebSocket(url, { headers });
 
+				ws.on('error', (error: Error) => {
+					console.warn('[websocket-ws] connection error:', error.message);
 					const errorData = {
 						message: 'WebSocket connection error',
 						description: error.message,
 					};
+					this.emit([
+						this.helpers.returnJsonArray([{ event: 'error', message: error.message }]),
+					]);
 					throw new NodeApiError(this.getNode(), errorData);
 				});
 
 				ws.on('close', () => {
+					console.debug('[websocket-ws] connection closed');
 					this.emit([
-						this.helpers.returnJsonArray([{
-							event: 'close'
-						}])
+						this.helpers.returnJsonArray([{ event: 'close' }]),
 					]);
+
+					if (autoReconnect && !isClosed) {
+						const canRetry = maxReconnects === 0 || reconnectAttempts < maxReconnects;
+						if (canRetry) {
+							reconnectAttempts++;
+							console.debug(`[websocket-ws] reconnecting in ${reconnectInterval / 1000}s (attempt ${reconnectAttempts})`);
+							setTimeout(() => {
+								startConsumer();
+							}, reconnectInterval);
+						} else {
+							console.warn(`[websocket-ws] max reconnect attempts (${maxReconnects}) reached`);
+						}
+					}
 				});
 
-				ws.on('message', (data: any, isBinary: boolean) => {
+				ws.on('message', (data: Buffer | string, isBinary: boolean) => {
 					console.debug('[websocket-ws] received new message');
-
-					let message = isBinary ? data : data.toString();
+					let message: any = isBinary ? data : data.toString();
 					try {
-						message = JSON.parse(message)
-					} catch (exception) {
-						console.warn('Unable to json parse websocket message: ' + message)
+						message = JSON.parse(message as string);
+					} catch {
+						console.warn('[websocket-ws] message is not JSON:', message);
 					}
+
+					reconnectAttempts = 0;
 
 					this.emit([
 						this.helpers.returnJsonArray([
@@ -117,10 +216,11 @@ export class WebsocketTrigger implements INodeType {
 
 				ws.on('open', () => {
 					console.debug('[websocket-ws] connected');
+					reconnectAttempts = 0;
 
-					if(sendInitMessage) {
-						initMessage = (this.getNodeParameter('initMessage') || '') as string;
-						ws.send(initMessage)
+					if (sendInitMessage) {
+						const initMessage = this.getNodeParameter('initMessage') as string;
+						ws!.send(initMessage);
 					}
 
 					this.emit([
@@ -131,29 +231,23 @@ export class WebsocketTrigger implements INodeType {
 							},
 						]),
 					]);
-				})
-			} catch (error) {
+				});
+
+			} catch (error: any) {
 				throw new NodeOperationError(
 					this.getNode(),
 					`Execution error: ${error.message}`,
 				);
 			}
-		}
+		};
 
 		await startConsumer();
 
-		// The "closeFunction" function gets called by n8n whenever
-		// the workflow gets deactivated and can so clean up.
 		async function closeFunction() {
-			ws.terminate();
+			isClosed = true;
+			if (ws) ws.terminate();
 		}
 
-		// The "manualTriggerFunction" function gets called by n8n
-		// when a user is in the workflow editor and starts the
-		// workflow manually. So the function has to make sure that
-		// the emit() gets called with similar data like when it
-		// would trigger by itself so that the user knows what data
-		// to expect.
 		async function manualTriggerFunction() {
 			await startConsumer();
 		}
@@ -162,6 +256,5 @@ export class WebsocketTrigger implements INodeType {
 			closeFunction,
 			manualTriggerFunction,
 		};
-
 	}
 }
