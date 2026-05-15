@@ -25,7 +25,7 @@ export class WebsocketTrigger implements INodeType {
 		outputs: ['main'],
 		credentials: [
 			{
-				name: 'httpHeaderAuth',
+				name: 'httpHeaderAuthApi',
 				required: false,
 				displayOptions: {
 					show: {
@@ -34,7 +34,7 @@ export class WebsocketTrigger implements INodeType {
 				},
 			},
 			{
-				name: 'httpQueryAuth',
+				name: 'httpQueryAuthApi',
 				required: false,
 				displayOptions: {
 					show: {
@@ -72,7 +72,7 @@ export class WebsocketTrigger implements INodeType {
 				description: 'Whether to automatically reconnect if the connection drops',
 			},
 			{
-				displayName: 'Reconnect Interval (seconds)',
+				displayName: 'Reconnect Interval (Seconds)',
 				name: 'reconnectInterval',
 				type: 'number',
 				default: 10,
@@ -137,14 +137,14 @@ export class WebsocketTrigger implements INodeType {
 			const headers: Record<string, string> = {};
 
 			if (authentication === 'headerAuth') {
-				const creds = await this.getCredentials('httpHeaderAuth') as ICredentialDataDecryptedObject;
+				const creds = await this.getCredentials('httpHeaderAuthApi') as ICredentialDataDecryptedObject;
 				const headerName  = (creds.name  as string) || 'Authorization';
 				const headerValue = (creds.value as string) || '';
 				headers[headerName] = headerValue;
 			}
 
 			if (authentication === 'queryAuth') {
-				const creds = await this.getCredentials('httpQueryAuth') as ICredentialDataDecryptedObject;
+				const creds = await this.getCredentials('httpQueryAuthApi') as ICredentialDataDecryptedObject;
 				const paramName  = (creds.name  as string) || 'token';
 				const paramValue = (creds.value as string) || '';
 				const separator = url.includes('?') ? '&' : '?';
