@@ -8,7 +8,7 @@ import {
 
 import WebSocket from 'ws';
 
-export class WebsocketTrigger implements INodeType {
+export class WebsocketReconnectTrigger implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Websocket Reconnect - Trigger',
 		name: 'websocketReconnectTrigger',
