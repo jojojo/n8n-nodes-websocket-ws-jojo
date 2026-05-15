@@ -23,11 +23,9 @@ export class WebsocketTrigger implements INodeType {
 		},
 		inputs: [],
 		outputs: ['main'],
-		// eslint-disable-next-line n8n-nodes-base/node-class-description-credentials-name-unsuffixed
 		credentials: [
 			{
-				// eslint-disable-next-line n8n-nodes-base/node-class-description-credentials-name-unsuffixed
-				name: 'httpHeaderAuth',
+				name: 'websocketHeaderAuthApi',
 				required: false,
 				displayOptions: {
 					show: {
@@ -36,8 +34,7 @@ export class WebsocketTrigger implements INodeType {
 				},
 			},
 			{
-				// eslint-disable-next-line n8n-nodes-base/node-class-description-credentials-name-unsuffixed
-				name: 'httpQueryAuth',
+				name: 'websocketQueryAuthApi',
 				required: false,
 				displayOptions: {
 					show: {
@@ -140,14 +137,14 @@ export class WebsocketTrigger implements INodeType {
 			const headers: Record<string, string> = {};
 
 			if (authentication === 'headerAuth') {
-				const creds = await this.getCredentials('httpHeaderAuth') as ICredentialDataDecryptedObject;
+				const creds = await this.getCredentials('websocketHeaderAuthApi') as ICredentialDataDecryptedObject;
 				const headerName  = (creds.name  as string) || 'Authorization';
 				const headerValue = (creds.value as string) || '';
 				headers[headerName] = headerValue;
 			}
 
 			if (authentication === 'queryAuth') {
-				const creds = await this.getCredentials('httpQueryAuth') as ICredentialDataDecryptedObject;
+				const creds = await this.getCredentials('websocketQueryAuthApi') as ICredentialDataDecryptedObject;
 				const paramName  = (creds.name  as string) || 'token';
 				const paramValue = (creds.value as string) || '';
 				const separator = url.includes('?') ? '&' : '?';
