@@ -12,7 +12,8 @@
       "Bash(git pull *)",
       "Bash(git rebase *)",
       "Bash(npm whoami *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(find /mnt/c/Users/santi/Documents/ws_test/node_modules/n8n-nodes-websocket-ws -not -path \"*/node_modules/*\" -type f 2>/dev/null | sort)"
     ]
   }
 }
