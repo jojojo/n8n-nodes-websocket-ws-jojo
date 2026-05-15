@@ -1,19 +1,19 @@
 {
-  "name": "n8n-nodes-websocket-ws",
-  "version": "0.4.0",
-  "description": "Websocket (ws) nodes for n8n. Using ws-library instead of socket.io",
+  "name": "n8n-nodes-websocket-ws-reconnect",
+  "version": "0.5.0",
+  "description": "Websocket (ws) trigger for n8n with auth (Bearer/query) and auto-reconnect support",
   "keywords": [
     "n8n-community-node-package"
   ],
   "license": "MIT",
-  "homepage": "",
+  "homepage": "https://github.com/santi648/n8n-nodes-websocket-ws-prueba",
   "author": {
-    "name": "Nicolai Schober",
-    "email": "sbz@schober.bz"
+    "name": "santaigop",
+    "email": "santiago.delavegavargas@gmail.com"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/SBZ-git/n8n-nodes-websocket-ws/tree/master"
+    "url": "https://github.com/santi648/n8n-nodes-websocket-ws-prueba"
   },
   "engines": {
     "node": ">=18.10",
