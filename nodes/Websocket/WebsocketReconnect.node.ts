@@ -15,8 +15,8 @@ import {
 
 export class Websocket implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'Websocket',
-		name: 'websocket',
+		displayName: 'Websocket (Reconnect)',
+		name: 'websocketReconnect',
 		icon: 'file:websocket.svg',
 		group: ['transform'],
 		version: 1,

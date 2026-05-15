@@ -12,8 +12,8 @@ import WebSocket from 'ws';
 
 export class WebsocketTrigger implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'Websocket - Trigger',
-		name: 'websocketTrigger',
+		displayName: 'Websocket Reconnect - Trigger',
+		name: 'websocketReconnectTrigger',
 		icon: 'file:websocket.svg',
 		group: ['trigger'],
 		version: 1,
