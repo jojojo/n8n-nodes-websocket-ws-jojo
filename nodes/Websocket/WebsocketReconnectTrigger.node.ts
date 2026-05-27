@@ -1,4 +1,5 @@
 import {
+	ICredentialDataDecryptedObject,
 	INodeType,
 	INodeTypeDescription,
 	ITriggerFunctions,
@@ -7,6 +8,66 @@ import {
 } from 'n8n-workflow';
 
 import WebSocket from 'ws';
+import https from 'https';
+import http from 'http';
+
+function buildMultipart(fields: Array<{ name: string; value: string }>): { body: Buffer; boundary: string } {
+	const boundary = `----FormBoundary${Date.now()}`;
+	const parts: Buffer[] = [];
+	for (const field of fields) {
+		parts.push(Buffer.from(
+			`--${boundary}\r\n` +
+			`Content-Disposition: form-data; name="${field.name}"\r\n` +
+			`\r\n` +
+			`${field.value}\r\n`,
+		));
+	}
+	parts.push(Buffer.from(`--${boundary}--\r\n`));
+	return { body: Buffer.concat(parts), boundary };
+}
+
+function doRequest(
+	url: string,
+	method: string,
+	headers: Record<string, string>,
+	body?: Buffer | string,
+): Promise<unknown> {
+	return new Promise((resolve, reject) => {
+		const isHttps = url.startsWith('https://');
+		const client = isHttps ? https : http;
+		const options: https.RequestOptions = {
+			method,
+			headers,
+			...(isHttps ? { rejectUnauthorized: false } : {}),
+		};
+		const req = client.request(url, options, (res) => {
+			let raw = '';
+			res.on('data', (chunk: Buffer) => { raw += chunk.toString(); });
+			res.on('end', () => {
+				const status = res.statusCode ?? 0;
+				if (status < 200 || status >= 300) {
+					reject(new Error(`Token refresh HTTP ${status}: ${raw}`));
+					return;
+				}
+				try { resolve(JSON.parse(raw)); }
+				catch { resolve(raw); }
+			});
+		});
+		req.on('error', reject);
+		if (body) req.write(body);
+		req.end();
+	});
+}
+
+function extractByPath(data: unknown, path: string): string {
+	if (!path) return String(data);
+	const parts = path.split('.');
+	let value: unknown = data;
+	for (const part of parts) {
+		value = (value as Record<string, unknown>)?.[part];
+	}
+	return String(value);
+}
 
 export class WebsocketReconnectTrigger implements INodeType {
 	description: INodeTypeDescription = {
@@ -15,20 +76,36 @@ export class WebsocketReconnectTrigger implements INodeType {
 		icon: 'file:websocket.svg',
 		group: ['trigger'],
 		version: 1,
-		description: 'Connect to ws endpoint and trigger flow on incoming message, open or close. Supports header/query auth and auto-reconnect.',
+		description: 'Connect to a WebSocket endpoint and trigger on incoming messages. Supports header/query auth, extra query parameters, periodic token refresh, and auto-reconnect.',
 		defaults: {
-			name: 'Websocket Connection & Message',
+			name: 'WebSocket Reconnect',
 		},
 		inputs: [],
 		outputs: ['main'],
-		properties: [
+		credentials: [
 			{
-				displayName: 'Websocket URL',
+				name: 'websocketHeaderAuthApi',
+				required: true,
+				displayOptions: { show: { authentication: ['headerAuth'] } },
+			},
+			{
+				name: 'websocketQueryAuthApi',
+				required: true,
+				displayOptions: { show: { authentication: ['queryAuth'] } },
+			},
+		],
+		properties: [
+
+			// ═══════════════════════════════════════════════════════════
+			// CONNECTION
+			// ═══════════════════════════════════════════════════════════
+			{
+				displayName: 'WebSocket URL',
 				name: 'websocketUrl',
 				type: 'string',
 				default: '',
-				placeholder: 'wss://example.com/ws',
-				description: 'URL of the WebSocket server',
+				placeholder: 'wss://example.com/ws?fmt=json',
+				description: 'Full WebSocket URL. Static query params (e.g. fmt=JSON) can be included here.',
 			},
 			{
 				displayName: 'Authentication',
@@ -40,101 +117,350 @@ export class WebsocketReconnectTrigger implements INodeType {
 					{ name: 'Query Parameter', value: 'queryAuth' },
 				],
 				default: 'none',
-				description: 'Authentication method',
+				description: 'Use credentials for auth. Choose None if you handle auth via Token Refresh or Query Parameters below.',
+			},
+
+			// ═══════════════════════════════════════════════════════════
+			// EXTRA QUERY PARAMETERS
+			// ═══════════════════════════════════════════════════════════
+			{
+				displayName: 'Extra Query Parameters',
+				name: 'queryParameters',
+				type: 'fixedCollection',
+				typeOptions: { multipleValues: true },
+				placeholder: 'Add Parameter',
+				default: {},
+				description: 'Static query parameters appended to the WebSocket URL on every connection',
+				options: [
+					{
+						name: 'parameters',
+						displayName: 'Parameter',
+						values: [
+							{
+								displayName: 'Name',
+								name: 'name',
+								type: 'string',
+								default: '',
+								description: 'Parameter name',
+							},
+							{
+								displayName: 'Value',
+								name: 'value',
+								type: 'string',
+								default: '',
+								description: 'Parameter value (do not URL-encode — the node handles that)',
+							},
+						],
+					},
+				],
+			},
+
+			// ═══════════════════════════════════════════════════════════
+			// TOKEN REFRESH
+			// ═══════════════════════════════════════════════════════════
+			{
+				displayName: 'Enable Token Refresh',
+				name: 'tokenRefreshEnabled',
+				type: 'boolean',
+				default: false,
+				description: 'Whether to fetch a fresh bearer token from an HTTP endpoint before connecting',
+			},
+
+			// — Refresh mode selector ————————————————————————————————————
+			{
+				displayName: 'Refresh Method',
+				name: 'tokenRefreshMode',
+				type: 'options',
+				options: [
+					{ name: 'Direct (Single Endpoint Returns Token)', value: 'direct' },
+					{ name: 'Two-Step (Fetch Current Token → Call Refresh Endpoint)', value: 'twoStep' },
+				],
+				default: 'direct',
+				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				description: 'How to obtain a fresh token. Direct: one request returns the token. Two-Step: first fetch the current token, then call a refresh endpoint using it.',
+			},
+
+			// ── DIRECT MODE (existing) ──────────────────────────────────
+			{
+				displayName: 'Token Refresh URL',
+				name: 'tokenRefreshUrl',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'https://api.example.com/auth/token',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'] } },
+				description: 'HTTP endpoint that returns a fresh token',
 			},
 			{
-				displayName: 'Header Name',
-				name: 'headerName',
+				displayName: 'HTTP Method',
+				name: 'tokenRefreshMethod',
+				type: 'options',
+				options: [
+					{ name: 'POST', value: 'POST' },
+					{ name: 'GET', value: 'GET' },
+				],
+				default: 'POST',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'] } },
+				description: 'HTTP method for the token refresh request',
+			},
+			{
+				displayName: 'Request Headers',
+				name: 'tokenRefreshHeaders',
+				type: 'fixedCollection',
+				typeOptions: { multipleValues: true },
+				placeholder: 'Add Header',
+				default: {},
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'] } },
+				description: 'Headers for the token refresh request (e.g. X-Admin-Token)',
+				options: [
+					{
+						name: 'headers',
+						displayName: 'Header',
+						values: [
+							{
+								displayName: 'Name',
+								name: 'name',
+								type: 'string',
+								default: '',
+								placeholder: 'X-Admin-Token',
+								description: 'Header name',
+							},
+							{
+								displayName: 'Value',
+								name: 'value',
+								type: 'string',
+								typeOptions: { password: true },
+								default: '',
+								description: 'Header value',
+							},
+						],
+					},
+				],
+			},
+			{
+				displayName: 'Body Type',
+				name: 'tokenRefreshBodyType',
+				type: 'options',
+				options: [
+					{ name: 'Form Data (Multipart/form-Data)', value: 'formData' },
+					{ name: 'JSON', value: 'json' },
+					{ name: 'No Body', value: 'none' },
+				],
+				default: 'formData',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'], tokenRefreshMethod: ['POST'] } },
+				description: 'Format of the request body',
+			},
+			{
+				displayName: 'Form Fields',
+				name: 'tokenRefreshFormFields',
+				type: 'fixedCollection',
+				typeOptions: { multipleValues: true },
+				placeholder: 'Add Field',
+				default: {},
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'], tokenRefreshMethod: ['POST'], tokenRefreshBodyType: ['formData'] } },
+				description: 'Form fields to send (e.g. tipo=Websockets, ttl_hours=12)',
+				options: [
+					{
+						name: 'fields',
+						displayName: 'Field',
+						values: [
+							{
+								displayName: 'Name',
+								name: 'name',
+								type: 'string',
+								default: '',
+								description: 'Field name',
+							},
+							{
+								displayName: 'Value',
+								name: 'value',
+								type: 'string',
+								default: '',
+								description: 'Field value',
+							},
+						],
+					},
+				],
+			},
+			{
+				displayName: 'JSON Body',
+				name: 'tokenRefreshJsonBody',
 				type: 'string',
+				typeOptions: { rows: 3, password: true },
+				default: '{}',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'], tokenRefreshMethod: ['POST'], tokenRefreshBodyType: ['json'] } },
+				description: 'JSON body for the token refresh POST request',
+			},
+			{
+				displayName: 'Token Field in Response',
+				name: 'tokenRefreshResponsePath',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'token   or   data.access_token',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'] } },
+				description: 'Dot-notation path to the token inside the JSON response. Example: if response is {"data":{"token":"abc"}}, enter data.token.',
+			},
+
+			// ── TWO-STEP MODE (new) ─────────────────────────────────────
+			// Step 1: GET current token
+			{
+				displayName: 'Step 1 - Fetch Current Token URL',
+				name: 'tsStep1Url',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'https://api.example.com/api/token/latest',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
+				description: 'GET endpoint that returns the current active bearer token',
+			},
+			{
+				displayName: 'Step 1 - Admin Header Name',
+				name: 'tsStep1AdminHeaderName',
+				type: 'string',
+				default: 'x-Admin',
+				placeholder: 'x-Admin',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
+				description: 'Name of the admin authentication header for the fetch request',
+			},
+			{
+				displayName: 'Step 1 - Admin Header Value',
+				name: 'tsStep1AdminHeaderValue',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'your-admin-key',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
+				description: 'Value of the admin header (kept secret)',
+			},
+			{
+				displayName: 'Step 1 - Token Field in Response',
+				name: 'tsStep1ResponsePath',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'token   or   data.bearer',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
+				description: 'Dot-notation path to the current token in the step 1 response',
+			},
+			// Step 2: Refresh using current token
+			{
+				displayName: 'Step 2 - Refresh URL',
+				name: 'tsStep2Url',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'https://api.example.com/api/token/refresh',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
+				description: 'POST endpoint that refreshes the token. The current token from step 1 is sent as Authorization: Bearer &lt;token&gt;.',
+			},
+			{
+				displayName: 'Step 2 - New Token Field in Response',
+				name: 'tsStep2ResponsePath',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				placeholder: 'token   or   data.new_token',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
+				description: 'Dot-notation path to the new token in the step 2 response',
+			},
+
+			// ── SHARED (both modes) ─────────────────────────────────────
+			{
+				displayName: 'WebSocket Query Param to Inject',
+				name: 'tokenRefreshTargetParam',
+				type: 'string',
+				typeOptions: { password: true },
 				default: 'Authorization',
-				displayOptions: {
-					show: { authentication: ['headerAuth'] },
-				},
-				description: 'Name of the HTTP header (e.g. Authorization)',
+				placeholder: 'Authorization',
+				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				description: 'Name of the query parameter that will receive the fresh token',
 			},
 			{
-				displayName: 'Header Value',
-				name: 'headerValue',
+				displayName: 'Token Prefix',
+				name: 'tokenRefreshValuePrefix',
 				type: 'string',
 				typeOptions: { password: true },
-				default: '',
-				displayOptions: {
-					show: { authentication: ['headerAuth'] },
-				},
-				description: 'Value of the header (e.g. Bearer mytoken)',
+				default: 'Bearer ',
+				placeholder: 'Bearer ',
+				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				description: 'Text prepended to the token value (include trailing space if needed, e.g. "Bearer ")',
+			},
+
+			// — Periodic refresh ———————————————————————————————————————
+			{
+				displayName: 'Refresh Token Periodically',
+				name: 'tokenRefreshOnSchedule',
+				type: 'boolean',
+				default: true,
+				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				description: 'Whether to automatically refresh the token and reconnect at a set interval (recommended when token has an expiry)',
 			},
 			{
-				displayName: 'Query Param Name',
-				name: 'queryParamName',
-				type: 'string',
-				default: 'token',
-				displayOptions: {
-					show: { authentication: ['queryAuth'] },
-				},
-				description: 'Name of the query parameter',
+				displayName: 'Refresh Interval (Hours)',
+				name: 'tokenRefreshIntervalHours',
+				type: 'number',
+				default: 11,
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshOnSchedule: [true] } },
+				description: 'How often to refresh the token and reconnect (set lower than the token TTL — e.g. if TTL is 12h, use 11)',
 			},
+
+			// ═══════════════════════════════════════════════════════════
+			// AUTO RECONNECT (on unexpected drops)
+			// ═══════════════════════════════════════════════════════════
 			{
-				displayName: 'Query Param Value',
-				name: 'queryParamValue',
-				type: 'string',
-				typeOptions: { password: true },
-				default: '',
-				displayOptions: {
-					show: { authentication: ['queryAuth'] },
-				},
-				description: 'Value of the query parameter',
-			},
-			{
-				displayName: 'Auto Reconnect',
+				displayName: 'Auto Reconnect on Drop',
 				name: 'autoReconnect',
 				type: 'boolean',
 				default: true,
-				description: 'Whether to automatically reconnect if the connection drops',
+				description: 'Whether to automatically reconnect if the connection drops unexpectedly',
 			},
 			{
 				displayName: 'Reconnect Interval (Seconds)',
 				name: 'reconnectInterval',
 				type: 'number',
 				default: 10,
-				displayOptions: {
-					show: { autoReconnect: [true] },
-				},
-				description: 'Seconds to wait before attempting reconnection',
+				displayOptions: { show: { autoReconnect: [true] } },
+				description: 'Seconds to wait before attempting reconnection after an unexpected drop',
 			},
 			{
 				displayName: 'Max Reconnect Attempts',
 				name: 'maxReconnectAttempts',
 				type: 'number',
 				default: 0,
-				displayOptions: {
-					show: { autoReconnect: [true] },
-				},
-				description: 'Maximum reconnection attempts. 0 = unlimited.',
+				displayOptions: { show: { autoReconnect: [true] } },
+				description: 'Maximum reconnection attempts after unexpected drop (0 = unlimited)',
 			},
+
+			// ═══════════════════════════════════════════════════════════
+			// INITIAL MESSAGE
+			// ═══════════════════════════════════════════════════════════
 			{
 				displayName: 'Send Initial Message',
 				name: 'sendInitMessage',
 				type: 'boolean',
 				default: false,
-				description: 'Whether to send a message immediately upon connecting',
+				description: 'Whether to send a message immediately after connecting',
 			},
 			{
 				displayName: 'Initial Message',
 				name: 'initMessage',
 				type: 'string',
-				displayOptions: {
-					show: { sendInitMessage: [true] },
-				},
+				displayOptions: { show: { sendInitMessage: [true] } },
 				required: true,
 				default: '{}',
-				description: 'Message to send upon connecting',
+				description: 'Message to send upon connecting (JSON or plain text)',
 			},
+
+			// ═══════════════════════════════════════════════════════════
+			// OUTPUT
+			// ═══════════════════════════════════════════════════════════
 			{
 				displayName: 'Return WS Resource',
 				name: 'returnWs',
 				type: 'boolean',
 				default: false,
-				description: 'Whether to return the ws resource (needed to send messages back)',
+				description: 'Whether to include the raw ws object in output (needed to send reply messages)',
 			},
 		],
 	};
@@ -143,114 +469,264 @@ export class WebsocketReconnectTrigger implements INodeType {
 		let ws: WebSocket | null = null;
 		let reconnectAttempts = 0;
 		let isClosed = false;
+		let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+		let currentBearerToken = '';
 
-		const websocketUrl      = this.getNodeParameter('websocketUrl') as string;
-		const authentication    = this.getNodeParameter('authentication') as string;
-		const sendInitMessage   = this.getNodeParameter('sendInitMessage') as boolean;
-		const returnWs          = this.getNodeParameter('returnWs') as boolean;
-		const autoReconnect     = this.getNodeParameter('autoReconnect') as boolean;
-		const reconnectInterval = (this.getNodeParameter('reconnectInterval') as number) * 1000;
-		const maxReconnects     = this.getNodeParameter('maxReconnectAttempts') as number;
+		const websocketUrl           = this.getNodeParameter('websocketUrl', '') as string;
+		const authentication         = this.getNodeParameter('authentication', 'none') as string;
+		const sendInitMessage        = this.getNodeParameter('sendInitMessage', false) as boolean;
+		const returnWs               = this.getNodeParameter('returnWs', false) as boolean;
+		const autoReconnect          = this.getNodeParameter('autoReconnect', true) as boolean;
+		const reconnectInterval      = (this.getNodeParameter('reconnectInterval', 10) as number) * 1000;
+		const maxReconnects          = this.getNodeParameter('maxReconnectAttempts', 0) as number;
+		const tokenRefreshEnabled    = this.getNodeParameter('tokenRefreshEnabled') as boolean;
+		const tokenRefreshOnSchedule = tokenRefreshEnabled && (this.getNodeParameter('tokenRefreshOnSchedule', false) as boolean);
+		const tokenRefreshIntervalMs = (this.getNodeParameter('tokenRefreshIntervalHours', 11) as number) * 3600 * 1000;
 
-		const buildConnectionOptions = (): { url: string; headers: Record<string, string> } => {
+		const fetchFreshToken = async (): Promise<string> => {
+			const refreshUrl    = this.getNodeParameter('tokenRefreshUrl', '') as string;
+			const refreshMethod = this.getNodeParameter('tokenRefreshMethod', 'POST') as string;
+			const responsePath  = this.getNodeParameter('tokenRefreshResponsePath', '') as string;
+			const valuePrefix   = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
+
+			const reqHeaders: Record<string, string> = { 'accept': 'application/json' };
+			const customHeaders = this.getNodeParameter('tokenRefreshHeaders', {}) as {
+				headers?: Array<{ name: string; value: string }>;
+			};
+			for (const h of customHeaders.headers || []) {
+				if (h.name) reqHeaders[h.name] = h.value;
+			}
+
+			let requestBody: Buffer | string | undefined;
+			if (refreshMethod === 'POST') {
+				const bodyType = this.getNodeParameter('tokenRefreshBodyType', 'formData') as string;
+				if (bodyType === 'formData') {
+					const formFieldsParam = this.getNodeParameter('tokenRefreshFormFields', {}) as {
+						fields?: Array<{ name: string; value: string }>;
+					};
+					const { body: multipartBody, boundary } = buildMultipart(formFieldsParam.fields || []);
+					reqHeaders['Content-Type'] = `multipart/form-data; boundary=${boundary}`;
+					reqHeaders['Content-Length'] = String(multipartBody.length);
+					requestBody = multipartBody;
+				} else if (bodyType === 'json') {
+					const jsonBody = this.getNodeParameter('tokenRefreshJsonBody', '{}') as string;
+					reqHeaders['Content-Type'] = 'application/json';
+					reqHeaders['Content-Length'] = String(Buffer.byteLength(jsonBody));
+					requestBody = jsonBody;
+				}
+			}
+
+			const data = await doRequest(refreshUrl, refreshMethod, reqHeaders, requestBody);
+			console.debug('[websocket-ws] token refresh response:', JSON.stringify(data));
+			const rawToken = extractByPath(data, responsePath);
+			if (!rawToken || rawToken === 'undefined' || rawToken === 'null') {
+				throw new NodeOperationError(
+					this.getNode(),
+					`Token refresh: could not find field "${responsePath}" in response. Full response: ${JSON.stringify(data)}`,
+				);
+			}
+			return `${valuePrefix}${rawToken}`;
+		};
+
+		const fetchFreshTokenTwoStep = async (): Promise<string> => {
+			const step1Url         = this.getNodeParameter('tsStep1Url', '') as string;
+			const adminHeaderName  = this.getNodeParameter('tsStep1AdminHeaderName', 'x-Admin') as string;
+			const adminHeaderValue = this.getNodeParameter('tsStep1AdminHeaderValue', '') as string;
+			const step1Path        = this.getNodeParameter('tsStep1ResponsePath', '') as string;
+			const valuePrefix      = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
+
+			const step1Headers: Record<string, string> = {
+				'accept': 'application/json',
+				[adminHeaderName]: adminHeaderValue,
+			};
+			const step1Data = await doRequest(step1Url, 'GET', step1Headers);
+			console.debug('[websocket-ws] two-step step1 response:', JSON.stringify(step1Data));
+			const currentToken = extractByPath(step1Data, step1Path);
+			if (!currentToken || currentToken === 'undefined' || currentToken === 'null') {
+				throw new NodeOperationError(
+					this.getNode(),
+					`Two-step refresh step 1: could not find field "${step1Path}" in response. Full response: ${JSON.stringify(step1Data)}`,
+				);
+			}
+
+			const step2Url  = this.getNodeParameter('tsStep2Url', '') as string;
+			const step2Path = this.getNodeParameter('tsStep2ResponsePath', '') as string;
+			const step2Headers: Record<string, string> = {
+				'accept': 'application/json',
+				'Authorization': `Bearer ${currentToken}`,
+				'Content-Length': '0',
+			};
+			const step2Data = await doRequest(step2Url, 'POST', step2Headers);
+			console.debug('[websocket-ws] two-step step2 response:', JSON.stringify(step2Data));
+			const newToken = extractByPath(step2Data, step2Path);
+			if (!newToken || newToken === 'undefined' || newToken === 'null') {
+				throw new NodeOperationError(
+					this.getNode(),
+					`Two-step refresh step 2: could not find field "${step2Path}" in response. Full response: ${JSON.stringify(step2Data)}`,
+				);
+			}
+			return `${valuePrefix}${newToken}`;
+		};
+
+		const buildConnectionOptions = async (): Promise<{ url: string; headers: Record<string, string> }> => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
 
 			if (authentication === 'headerAuth') {
-				const headerName  = this.getNodeParameter('headerName') as string || 'Authorization';
-				const headerValue = this.getNodeParameter('headerValue') as string || '';
-				headers[headerName] = headerValue;
+				const creds = await this.getCredentials('websocketHeaderAuthApi') as ICredentialDataDecryptedObject;
+				headers[(creds.headerName as string) || 'Authorization'] = (creds.headerValue as string) || '';
 			}
 
 			if (authentication === 'queryAuth') {
-				const paramName  = this.getNodeParameter('queryParamName') as string || 'token';
-				const paramValue = this.getNodeParameter('queryParamValue') as string || '';
-				const separator = url.includes('?') ? '&' : '?';
-				url = `${url}${separator}${encodeURIComponent(paramName)}=${encodeURIComponent(paramValue)}`;
+				const creds = await this.getCredentials('websocketQueryAuthApi') as ICredentialDataDecryptedObject;
+				const sep = url.includes('?') ? '&' : '?';
+				url = `${url}${sep}${encodeURIComponent((creds.paramName as string) || 'token')}=${encodeURIComponent((creds.paramValue as string) || '')}`;
+			}
+
+			const queryParameters = this.getNodeParameter('queryParameters', {}) as {
+				parameters?: Array<{ name: string; value: string }>;
+			};
+			for (const param of queryParameters.parameters || []) {
+				if (param.name) {
+					const sep = url.includes('?') ? '&' : '?';
+					url = `${url}${sep}${encodeURIComponent(param.name)}=${encodeURIComponent(param.value)}`;
+				}
+			}
+
+			if (tokenRefreshEnabled) {
+				const refreshMode = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
+				const targetParam = this.getNodeParameter('tokenRefreshTargetParam', 'Authorization') as string;
+				const freshToken = refreshMode === 'twoStep'
+					? await fetchFreshTokenTwoStep()
+					: await fetchFreshToken();
+				currentBearerToken = freshToken;
+				const sep = url.includes('?') ? '&' : '?';
+				url = `${url}${sep}${encodeURIComponent(targetParam)}=${encodeURIComponent(freshToken)}`;
+				console.debug('[websocket-ws] token refreshed, injected into', targetParam);
 			}
 
 			return { url, headers };
 		};
 
+		// silentClose: set before terminating old WS during overlap — suppresses reconnect
+		let silentClose = false;
+
+		const emitTokenRefreshed = () => {
+			if (!currentBearerToken) return;
+			this.emit([this.helpers.returnJsonArray([{
+				event: 'tokenRefreshed',
+				bearerToken: currentBearerToken,
+				expiresInHours: this.getNodeParameter('tokenRefreshIntervalHours', 11),
+			}])]);
+		};
+
+		const setupWsEvents = (wsInstance: WebSocket) => {
+			wsInstance.on('error', (error: Error) => {
+				console.warn('[websocket-ws] connection error:', error.message);
+				this.emit([this.helpers.returnJsonArray([{ event: 'error', message: error.message }])]);
+			});
+
+			wsInstance.on('close', () => {
+				if (silentClose) { silentClose = false; return; }
+
+				console.debug('[websocket-ws] connection closed');
+				this.emit([this.helpers.returnJsonArray([{ event: 'close' }])]);
+				if (refreshTimer) clearTimeout(refreshTimer);
+				if (isClosed) return;
+
+				if (autoReconnect) {
+					const canRetry = maxReconnects === 0 || reconnectAttempts < maxReconnects;
+					if (canRetry) {
+						reconnectAttempts++;
+						console.debug(`[websocket-ws] reconnecting in ${reconnectInterval / 1000}s (attempt ${reconnectAttempts})`);
+						setTimeout(() => { startConsumer(); }, reconnectInterval);
+					} else {
+						console.warn(`[websocket-ws] max reconnect attempts (${maxReconnects}) reached`);
+					}
+				}
+			});
+
+			wsInstance.on('message', (data: Buffer | string, isBinary: boolean) => {
+				let message: any = isBinary ? data : data.toString();
+				try { message = JSON.parse(message as string); }
+				catch { /* not JSON */ }
+				reconnectAttempts = 0;
+				this.emit([this.helpers.returnJsonArray([{ event: 'message', message, ws: returnWs ? ws : null }])]);
+			});
+
+			wsInstance.on('open', () => {
+				console.debug('[websocket-ws] connected');
+				reconnectAttempts = 0;
+				if (sendInitMessage) {
+					wsInstance.send(this.getNodeParameter('initMessage', '') as string);
+				}
+				this.emit([this.helpers.returnJsonArray([{
+					event: 'open',
+					bearerToken: currentBearerToken || null,
+					ws: returnWs ? wsInstance : null,
+				}])]);
+				emitTokenRefreshed();
+				scheduleTokenRefresh();
+			});
+		};
+
+		// Overlap refresh: connect new WS before closing old one
+		const doOverlapRefresh = async () => {
+			console.debug('[websocket-ws] overlap token refresh starting');
+			try {
+				const { url, headers } = await buildConnectionOptions();
+				const newWs = new WebSocket(url, { headers });
+
+				newWs.once('error', (error: Error) => {
+					console.warn('[websocket-ws] overlap new connection failed, keeping old:', error.message);
+					newWs.terminate();
+					scheduleTokenRefresh(); // retry after interval
+				});
+
+				newWs.once('open', () => {
+					console.debug('[websocket-ws] overlap new connection open, closing old');
+					const oldWs = ws;
+					ws = newWs;
+					setupWsEvents(newWs);
+					if (oldWs) {
+						silentClose = true;
+						oldWs.terminate();
+					}
+					reconnectAttempts = 0;
+					if (sendInitMessage) {
+						newWs.send(this.getNodeParameter('initMessage', '') as string);
+					}
+					this.emit([this.helpers.returnJsonArray([{
+						event: 'open',
+						bearerToken: currentBearerToken || null,
+						ws: returnWs ? newWs : null,
+					}])]);
+					emitTokenRefreshed();
+					scheduleTokenRefresh();
+				});
+			} catch (error: unknown) {
+				const msg = error instanceof Error ? error.message : String(error);
+				console.warn('[websocket-ws] overlap refresh error:', msg);
+				scheduleTokenRefresh();
+			}
+		};
+
+		const scheduleTokenRefresh = () => {
+			if (refreshTimer) clearTimeout(refreshTimer);
+			if (!tokenRefreshOnSchedule || isClosed) return;
+			refreshTimer = setTimeout(() => {
+				if (!isClosed) doOverlapRefresh();
+			}, tokenRefreshIntervalMs);
+		};
+
 		const startConsumer = async (): Promise<void> => {
 			try {
-				const { url, headers } = buildConnectionOptions();
-
+				const { url, headers } = await buildConnectionOptions();
 				ws = new WebSocket(url, { headers });
-
-				ws.on('error', (error: Error) => {
-					console.warn('[websocket-ws] connection error:', error.message);
-					this.emit([
-						this.helpers.returnJsonArray([{ event: 'error', message: error.message }]),
-					]);
-				});
-
-				ws.on('close', () => {
-					console.debug('[websocket-ws] connection closed');
-					this.emit([
-						this.helpers.returnJsonArray([{ event: 'close' }]),
-					]);
-
-					if (autoReconnect && !isClosed) {
-						const canRetry = maxReconnects === 0 || reconnectAttempts < maxReconnects;
-						if (canRetry) {
-							reconnectAttempts++;
-							console.debug(`[websocket-ws] reconnecting in ${reconnectInterval / 1000}s (attempt ${reconnectAttempts})`);
-							setTimeout(() => {
-								startConsumer();
-							}, reconnectInterval);
-						} else {
-							console.warn(`[websocket-ws] max reconnect attempts (${maxReconnects}) reached`);
-						}
-					}
-				});
-
-				ws.on('message', (data: Buffer | string, isBinary: boolean) => {
-					console.debug('[websocket-ws] received new message');
-					let message: any = isBinary ? data : data.toString();
-					try {
-						message = JSON.parse(message as string);
-					} catch {
-						console.warn('[websocket-ws] message is not JSON:', message);
-					}
-
-					reconnectAttempts = 0;
-
-					this.emit([
-						this.helpers.returnJsonArray([
-							{
-								event: 'message',
-								message,
-								ws: returnWs ? ws : null,
-							},
-						]),
-					]);
-				});
-
-				ws.on('open', () => {
-					console.debug('[websocket-ws] connected');
-					reconnectAttempts = 0;
-
-					if (sendInitMessage) {
-						const initMessage = this.getNodeParameter('initMessage') as string;
-						ws!.send(initMessage);
-					}
-
-					this.emit([
-						this.helpers.returnJsonArray([
-							{
-								event: 'open',
-								ws: returnWs ? ws : null,
-							},
-						]),
-					]);
-				});
-
-			} catch (error: any) {
-				throw new NodeOperationError(
-					this.getNode(),
-					`Execution error: ${error.message}`,
-				);
+				setupWsEvents(ws);
+			} catch (error: unknown) {
+				const msg = error instanceof Error ? error.message : String(error);
+				throw new NodeOperationError(this.getNode(), `Execution error: ${msg}`);
 			}
 		};
 
@@ -258,6 +734,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 		async function closeFunction() {
 			isClosed = true;
+			if (refreshTimer) clearTimeout(refreshTimer);
 			if (ws) ws.terminate();
 		}
 
@@ -265,9 +742,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 			await startConsumer();
 		}
 
-		return {
-			closeFunction,
-			manualTriggerFunction,
-		};
+		return { closeFunction, manualTriggerFunction };
 	}
 }
