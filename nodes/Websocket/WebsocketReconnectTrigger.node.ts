@@ -172,8 +172,8 @@ export class WebsocketReconnectTrigger implements INodeType {
 				name: 'tokenRefreshMode',
 				type: 'options',
 				options: [
-					{ name: 'Direct (Single Endpoint Returns Token)', value: 'direct' },
-					{ name: 'Two-Step (Fetch Current Token → Call Refresh Endpoint)', value: 'twoStep' },
+					{ name: 'Direct (single endpoint returns token)', value: 'direct' },
+					{ name: 'Two-Step (fetch current token → call refresh endpoint)', value: 'twoStep' },
 				],
 				default: 'direct',
 				displayOptions: { show: { tokenRefreshEnabled: [true] } },
@@ -352,7 +352,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				default: '',
 				placeholder: 'https://api.example.com/api/token/refresh',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
-				description: 'POST endpoint that refreshes the token. The current token from step 1 is sent as Authorization: Bearer &lt;token&gt;.',
+				description: 'POST endpoint that refreshes the token. The current token from step 1 is sent as Authorization: Bearer <token>.',
 			},
 			{
 				displayName: 'Step 2 - New Token Field in Response',
@@ -484,10 +484,57 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const tokenRefreshIntervalMs = (this.getNodeParameter('tokenRefreshIntervalHours', 11) as number) * 3600 * 1000;
 
 		const fetchFreshToken = async (): Promise<string> => {
+			const refreshMode   = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
+			const valuePrefix   = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
+
+			// ── TWO-STEP MODE ────────────────────────────────────────────
+			if (refreshMode === 'twoStep') {
+				const step1Url             = this.getNodeParameter('tsStep1Url', '') as string;
+				const step1AdminHeaderName = this.getNodeParameter('tsStep1AdminHeaderName', 'x-Admin') as string;
+				const step1AdminHeaderValue= this.getNodeParameter('tsStep1AdminHeaderValue', '') as string;
+				const step1ResponsePath    = this.getNodeParameter('tsStep1ResponsePath', '') as string;
+
+				// Step 1: GET current token using admin header
+				const step1Headers: Record<string, string> = {
+					'accept': 'application/json',
+					[step1AdminHeaderName]: step1AdminHeaderValue,
+				};
+				const step1Data = await doRequest(step1Url, 'GET', step1Headers);
+				console.debug('[websocket-ws] two-step step1 response:', JSON.stringify(step1Data));
+
+				const currentToken = extractByPath(step1Data, step1ResponsePath);
+				if (!currentToken || currentToken === 'undefined' || currentToken === 'null') {
+					throw new NodeOperationError(
+						this.getNode(),
+						`Two-step token refresh (step 1): could not find field "${step1ResponsePath}" in response. Full response: ${JSON.stringify(step1Data)}`,
+					);
+				}
+
+				// Step 2: POST to refresh endpoint, passing current token as Bearer
+				const step2Url          = this.getNodeParameter('tsStep2Url', '') as string;
+				const step2ResponsePath = this.getNodeParameter('tsStep2ResponsePath', '') as string;
+
+				const step2Headers: Record<string, string> = {
+					'accept': 'application/json',
+					'Authorization': `Bearer ${currentToken}`,
+				};
+				const step2Data = await doRequest(step2Url, 'POST', step2Headers);
+				console.debug('[websocket-ws] two-step step2 response:', JSON.stringify(step2Data));
+
+				const newToken = extractByPath(step2Data, step2ResponsePath);
+				if (!newToken || newToken === 'undefined' || newToken === 'null') {
+					throw new NodeOperationError(
+						this.getNode(),
+						`Two-step token refresh (step 2): could not find field "${step2ResponsePath}" in response. Full response: ${JSON.stringify(step2Data)}`,
+					);
+				}
+				return `${valuePrefix}${newToken}`;
+			}
+
+			// ── DIRECT MODE ──────────────────────────────────────────────
 			const refreshUrl    = this.getNodeParameter('tokenRefreshUrl', '') as string;
 			const refreshMethod = this.getNodeParameter('tokenRefreshMethod', 'POST') as string;
 			const responsePath  = this.getNodeParameter('tokenRefreshResponsePath', '') as string;
-			const valuePrefix   = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
 
 			const reqHeaders: Record<string, string> = { 'accept': 'application/json' };
 			const customHeaders = this.getNodeParameter('tokenRefreshHeaders', {}) as {
@@ -528,46 +575,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 			return `${valuePrefix}${rawToken}`;
 		};
 
-		const fetchFreshTokenTwoStep = async (): Promise<string> => {
-			const step1Url         = this.getNodeParameter('tsStep1Url', '') as string;
-			const adminHeaderName  = this.getNodeParameter('tsStep1AdminHeaderName', 'x-Admin') as string;
-			const adminHeaderValue = this.getNodeParameter('tsStep1AdminHeaderValue', '') as string;
-			const step1Path        = this.getNodeParameter('tsStep1ResponsePath', '') as string;
-			const valuePrefix      = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
-
-			const step1Headers: Record<string, string> = {
-				'accept': 'application/json',
-				[adminHeaderName]: adminHeaderValue,
-			};
-			const step1Data = await doRequest(step1Url, 'GET', step1Headers);
-			console.debug('[websocket-ws] two-step step1 response:', JSON.stringify(step1Data));
-			const currentToken = extractByPath(step1Data, step1Path);
-			if (!currentToken || currentToken === 'undefined' || currentToken === 'null') {
-				throw new NodeOperationError(
-					this.getNode(),
-					`Two-step refresh step 1: could not find field "${step1Path}" in response. Full response: ${JSON.stringify(step1Data)}`,
-				);
-			}
-
-			const step2Url  = this.getNodeParameter('tsStep2Url', '') as string;
-			const step2Path = this.getNodeParameter('tsStep2ResponsePath', '') as string;
-			const step2Headers: Record<string, string> = {
-				'accept': 'application/json',
-				'Authorization': `Bearer ${currentToken}`,
-				'Content-Length': '0',
-			};
-			const step2Data = await doRequest(step2Url, 'POST', step2Headers);
-			console.debug('[websocket-ws] two-step step2 response:', JSON.stringify(step2Data));
-			const newToken = extractByPath(step2Data, step2Path);
-			if (!newToken || newToken === 'undefined' || newToken === 'null') {
-				throw new NodeOperationError(
-					this.getNode(),
-					`Two-step refresh step 2: could not find field "${step2Path}" in response. Full response: ${JSON.stringify(step2Data)}`,
-				);
-			}
-			return `${valuePrefix}${newToken}`;
-		};
-
 		const buildConnectionOptions = async (): Promise<{ url: string; headers: Record<string, string> }> => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
@@ -594,11 +601,8 @@ export class WebsocketReconnectTrigger implements INodeType {
 			}
 
 			if (tokenRefreshEnabled) {
-				const refreshMode = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
 				const targetParam = this.getNodeParameter('tokenRefreshTargetParam', 'Authorization') as string;
-				const freshToken = refreshMode === 'twoStep'
-					? await fetchFreshTokenTwoStep()
-					: await fetchFreshToken();
+				const freshToken = await fetchFreshToken();
 				currentBearerToken = freshToken;
 				const sep = url.includes('?') ? '&' : '?';
 				url = `${url}${sep}${encodeURIComponent(targetParam)}=${encodeURIComponent(freshToken)}`;
