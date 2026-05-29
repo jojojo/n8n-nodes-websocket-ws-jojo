@@ -172,8 +172,8 @@ export class WebsocketReconnectTrigger implements INodeType {
 				name: 'tokenRefreshMode',
 				type: 'options',
 				options: [
-					{ name: 'Direct (single endpoint returns token)', value: 'direct' },
-					{ name: 'Two-Step (fetch current token → call refresh endpoint)', value: 'twoStep' },
+					{ name: 'Direct (Single Endpoint Returns Token)', value: 'direct' },
+					{ name: 'Two-Step (Fetch Current Token → Call Refresh Endpoint)', value: 'twoStep' },
 				],
 				default: 'direct',
 				displayOptions: { show: { tokenRefreshEnabled: [true] } },
@@ -352,7 +352,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				default: '',
 				placeholder: 'https://api.example.com/api/token/refresh',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
-				description: 'POST endpoint that refreshes the token. The current token from step 1 is sent as Authorization: Bearer <token>.',
+				description: 'POST endpoint that refreshes the token. The current token from step 1 is sent as Authorization: Bearer &lt;token&gt;.',
 			},
 			{
 				displayName: 'Step 2 - New Token Field in Response',
