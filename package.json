@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-websocket-ws-prueba",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "WebSocket trigger for n8n with header/query auth and auto-reconnect",
   "keywords": [
     "n8n-community-node-package"

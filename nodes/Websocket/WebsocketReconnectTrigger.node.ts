@@ -483,6 +483,38 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const tokenRefreshOnSchedule = tokenRefreshEnabled && (this.getNodeParameter('tokenRefreshOnSchedule', false) as boolean);
 		const tokenRefreshIntervalMs = (this.getNodeParameter('tokenRefreshIntervalHours', 11) as number) * 3600 * 1000;
 
+		// Fetch step-1 token only (GET latest active token) — used for initial connect and reconnect-on-drop
+		const fetchLatestToken = async (): Promise<string> => {
+			const refreshMode = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
+			const valuePrefix = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
+
+			if (refreshMode === 'twoStep') {
+				const step1Url              = this.getNodeParameter('tsStep1Url', '') as string;
+				const step1AdminHeaderName  = this.getNodeParameter('tsStep1AdminHeaderName', 'x-Admin') as string;
+				const step1AdminHeaderValue = this.getNodeParameter('tsStep1AdminHeaderValue', '') as string;
+				const step1ResponsePath     = this.getNodeParameter('tsStep1ResponsePath', '') as string;
+
+				const step1Headers: Record<string, string> = {
+					'accept': 'application/json',
+					[step1AdminHeaderName]: step1AdminHeaderValue,
+				};
+				const step1Data = await doRequest(step1Url, 'GET', step1Headers);
+				console.debug('[websocket-ws] two-step step1 (latest) response:', JSON.stringify(step1Data));
+
+				const currentToken = extractByPath(step1Data, step1ResponsePath);
+				if (!currentToken || currentToken === 'undefined' || currentToken === 'null') {
+					throw new NodeOperationError(
+						this.getNode(),
+						`Two-step token (step 1): could not find field "${step1ResponsePath}" in response. Full response: ${JSON.stringify(step1Data)}`,
+					);
+				}
+				return `${valuePrefix}${currentToken}`;
+			}
+
+			// direct mode: same single-endpoint fetch
+			return fetchFreshToken();
+		};
+
 		const fetchFreshToken = async (): Promise<string> => {
 			const refreshMode   = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
 			const valuePrefix   = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
@@ -575,7 +607,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 			return `${valuePrefix}${rawToken}`;
 		};
 
-		const buildConnectionOptions = async (): Promise<{ url: string; headers: Record<string, string> }> => {
+		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string> }> => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
 
@@ -602,7 +634,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 			if (tokenRefreshEnabled) {
 				const targetParam = this.getNodeParameter('tokenRefreshTargetParam', 'Authorization') as string;
-				const freshToken = await fetchFreshToken();
+				const freshToken = useFullRefresh ? await fetchFreshToken() : await fetchLatestToken();
 				currentBearerToken = freshToken;
 				const sep = url.includes('?') ? '&' : '?';
 				url = `${url}${sep}${encodeURIComponent(targetParam)}=${encodeURIComponent(freshToken)}`;
@@ -678,7 +710,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const doOverlapRefresh = async () => {
 			console.debug('[websocket-ws] overlap token refresh starting');
 			try {
-				const { url, headers } = await buildConnectionOptions();
+				const { url, headers } = await buildConnectionOptions(true);
 				const newWs = new WebSocket(url, { headers });
 
 				newWs.once('error', (error: Error) => {
