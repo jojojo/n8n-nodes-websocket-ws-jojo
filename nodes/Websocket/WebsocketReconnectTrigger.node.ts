@@ -397,12 +397,25 @@ export class WebsocketReconnectTrigger implements INodeType {
 				description: 'Whether to automatically refresh the token and reconnect at a set interval (recommended when token has an expiry)',
 			},
 			{
-				displayName: 'Refresh Interval (Hours)',
+				displayName: 'Refresh Interval',
 				name: 'tokenRefreshIntervalHours',
 				type: 'number',
 				default: 11,
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshOnSchedule: [true] } },
-				description: 'How often to refresh the token and reconnect (set lower than the token TTL — e.g. if TTL is 12h, use 11)',
+				description: 'How often to refresh the token and reconnect. Unit is set by the field below.',
+			},
+			{
+				displayName: 'Refresh Interval Unit',
+				name: 'tokenRefreshIntervalUnit',
+				type: 'options',
+				options: [
+					{ name: 'Hours', value: 'hours' },
+					{ name: 'Minutes', value: 'minutes' },
+					{ name: 'Seconds', value: 'seconds' },
+				],
+				default: 'hours',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshOnSchedule: [true] } },
+				description: 'Unit for the refresh interval above',
 			},
 
 			// ═══════════════════════════════════════════════════════════
@@ -481,7 +494,10 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const maxReconnects          = this.getNodeParameter('maxReconnectAttempts', 0) as number;
 		const tokenRefreshEnabled    = this.getNodeParameter('tokenRefreshEnabled') as boolean;
 		const tokenRefreshOnSchedule = tokenRefreshEnabled && (this.getNodeParameter('tokenRefreshOnSchedule', false) as boolean);
-		const tokenRefreshIntervalMs = (this.getNodeParameter('tokenRefreshIntervalHours', 11) as number) * 3600 * 1000;
+		const tokenRefreshIntervalValue = this.getNodeParameter('tokenRefreshIntervalHours', 11) as number;
+		const tokenRefreshIntervalUnit  = this.getNodeParameter('tokenRefreshIntervalUnit', 'hours') as string;
+		const unitMs = tokenRefreshIntervalUnit === 'seconds' ? 1000 : tokenRefreshIntervalUnit === 'minutes' ? 60_000 : 3_600_000;
+		const tokenRefreshIntervalMs = tokenRefreshIntervalValue * unitMs;
 
 		// Fetch step-1 token only (GET latest active token) — used for initial connect and reconnect-on-drop
 		const fetchLatestToken = async (): Promise<string> => {
@@ -644,15 +660,16 @@ export class WebsocketReconnectTrigger implements INodeType {
 			return { url, headers };
 		};
 
-		// silentClose: set before terminating old WS during overlap — suppresses reconnect
-		let silentClose = false;
+		// Per-instance set: WS instances that should close silently (no event, no reconnect)
+		const silentCloseInstances = new Set<WebSocket>();
 
 		const emitTokenRefreshed = () => {
 			if (!currentBearerToken) return;
 			this.emit([this.helpers.returnJsonArray([{
 				event: 'tokenRefreshed',
 				bearerToken: currentBearerToken,
-				expiresInHours: this.getNodeParameter('tokenRefreshIntervalHours', 11),
+				expiresIn: this.getNodeParameter('tokenRefreshIntervalHours', 11),
+				expiresInUnit: this.getNodeParameter('tokenRefreshIntervalUnit', 'hours'),
 			}])]);
 		};
 
@@ -663,7 +680,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 			});
 
 			wsInstance.on('close', () => {
-				if (silentClose) { silentClose = false; return; }
+				if (silentCloseInstances.has(wsInstance)) { silentCloseInstances.delete(wsInstance); return; }
 
 				console.debug('[websocket-ws] connection closed');
 				this.emit([this.helpers.returnJsonArray([{ event: 'close' }])]);
@@ -709,24 +726,30 @@ export class WebsocketReconnectTrigger implements INodeType {
 		// Overlap refresh: connect new WS before closing old one
 		const doOverlapRefresh = async () => {
 			console.debug('[websocket-ws] overlap token refresh starting');
+			// Mark current WS as silently-closeable NOW — server may close it as soon
+			// as the new connection arrives, before newWs fires 'open'.
+			const outgoingWs = ws;
+			if (outgoingWs) silentCloseInstances.add(outgoingWs);
+
 			try {
 				const { url, headers } = await buildConnectionOptions(true);
 				const newWs = new WebSocket(url, { headers });
 
 				newWs.once('error', (error: Error) => {
 					console.warn('[websocket-ws] overlap new connection failed, keeping old:', error.message);
+					// New connection failed — remove silent mark so old WS close still triggers reconnect
+					if (outgoingWs) silentCloseInstances.delete(outgoingWs);
 					newWs.terminate();
 					scheduleTokenRefresh(); // retry after interval
 				});
 
 				newWs.once('open', () => {
 					console.debug('[websocket-ws] overlap new connection open, closing old');
-					const oldWs = ws;
 					ws = newWs;
 					setupWsEvents(newWs);
-					if (oldWs) {
-						silentClose = true;
-						oldWs.terminate();
+					if (outgoingWs) {
+						silentCloseInstances.add(outgoingWs); // ensure still marked
+						outgoingWs.terminate();
 					}
 					reconnectAttempts = 0;
 					if (sendInitMessage) {
@@ -741,6 +764,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					scheduleTokenRefresh();
 				});
 			} catch (error: unknown) {
+				if (outgoingWs) silentCloseInstances.delete(outgoingWs);
 				const msg = error instanceof Error ? error.message : String(error);
 				console.warn('[websocket-ws] overlap refresh error:', msg);
 				scheduleTokenRefresh();
