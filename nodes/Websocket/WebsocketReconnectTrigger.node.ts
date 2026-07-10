@@ -205,6 +205,10 @@ function hashPreview(value: string): string {
 	return Math.abs(hash).toString(16);
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 type TokenInjectionMethod = 'authorizationHeader' | 'queryParameter' | 'customHeader';
 
 function injectTokenIntoConnection(params: {
@@ -578,6 +582,14 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayOptions: { show: { tokenRefreshEnabled: [true] } },
 				description: 'Text prepended to the token value (include trailing space if needed, e.g. "Bearer ")',
 			},
+			{
+				displayName: 'Handshake Delay (Milliseconds)',
+				name: 'tokenHandshakeDelayMs',
+				type: 'number',
+				default: 0,
+				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				description: 'Optional delay between token retrieval and opening the WebSocket connection',
+			},
 
 			// — Periodic refresh ———————————————————————————————————————
 			{
@@ -696,6 +708,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const maxReconnects          = this.getNodeParameter('maxReconnectAttempts', 0) as number;
 		const tokenRefreshEnabled    = this.getNodeParameter('tokenRefreshEnabled') as boolean;
 		const tokenRefreshOnSchedule = tokenRefreshEnabled && (this.getNodeParameter('tokenRefreshOnSchedule', false) as boolean);
+			const tokenHandshakeDelayMs  = tokenRefreshEnabled ? (this.getNodeParameter('tokenHandshakeDelayMs', 0) as number) : 0;
 		const tokenRefreshIntervalValue = this.getNodeParameter('tokenRefreshIntervalHours', 11) as number;
 		const tokenRefreshIntervalUnit  = this.getNodeParameter('tokenRefreshIntervalUnit', 'hours') as string;
 		const unitMs = tokenRefreshIntervalUnit === 'seconds' ? 1000 : tokenRefreshIntervalUnit === 'minutes' ? 60_000 : 3_600_000;
@@ -942,6 +955,13 @@ export class WebsocketReconnectTrigger implements INodeType {
 			return { url, headers, bearerToken, rawAccessToken };
 		};
 
+		const applyHandshakeDelay = async () => {
+			if (tokenHandshakeDelayMs > 0) {
+				console.debug('[websocket-ws] delaying websocket handshake by', tokenHandshakeDelayMs, 'ms');
+				await sleep(tokenHandshakeDelayMs);
+			}
+		};
+
 		// Per-instance set: WS instances that should close silently (no event, no reconnect)
 		const silentCloseInstances = new Set<WebSocket>();
 
@@ -1045,6 +1065,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 				try {
 					const { url, headers, bearerToken, rawAccessToken } = await buildConnectionOptions(true);
+					await applyHandshakeDelay();
 					if (debugMode) {
 						console.debug('[websocket-ws][trace]', 'ws.overlap.connect', JSON.stringify({
 							url: sanitizeUrlForDebug(url),
@@ -1105,6 +1126,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 			await runExclusiveConnectionFlow(async () => {
 				try {
 					const { url, headers, bearerToken, rawAccessToken } = await buildConnectionOptions();
+					await applyHandshakeDelay();
 					emitDebug('wsHandshakePrepared', {
 						url: sanitizeUrlForDebug(url),
 						headerKeys: Object.keys(headers),
