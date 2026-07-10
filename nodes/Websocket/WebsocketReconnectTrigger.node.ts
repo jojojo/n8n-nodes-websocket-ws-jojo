@@ -119,6 +119,15 @@ function getTokenDiagnostics(token: string): Record<string, unknown> {
 	return diagnostics;
 }
 
+function hashPreview(value: string): string {
+	let hash = 0;
+	for (let index = 0; index < value.length; index++) {
+		hash = ((hash << 5) - hash) + value.charCodeAt(index);
+		hash |= 0;
+	}
+	return Math.abs(hash).toString(16);
+}
+
 type TokenInjectionMethod = 'authorizationHeader' | 'queryParameter' | 'customHeader';
 
 function injectTokenIntoConnection(params: {
@@ -885,6 +894,11 @@ export class WebsocketReconnectTrigger implements INodeType {
 						authDiagnostics: {
 							hasAuthorizationHeader: currentBearerToken.length > 0,
 							headerPrefix: currentBearerToken ? currentBearerToken.split(' ')[0] : null,
+							authorizationLength: currentBearerToken.length,
+							authorizationPreview: currentBearerToken
+								? `${currentBearerToken.slice(0, 12)}...${currentBearerToken.slice(-8)}`
+								: null,
+							authorizationHash: currentBearerToken ? hashPreview(currentBearerToken) : null,
 							tokenDiagnostics,
 						},
 					};
