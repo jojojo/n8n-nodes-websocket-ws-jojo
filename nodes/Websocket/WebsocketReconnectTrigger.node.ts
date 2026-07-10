@@ -430,6 +430,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Header Name',
 				name: 'tokenRefreshHeaderName',
 				type: 'string',
+				typeOptions: { password: true },
 				default: 'X-API-Key',
 				placeholder: 'X-API-Key',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenInjectionMethod: ['customHeader'] } },
@@ -543,6 +544,8 @@ export class WebsocketReconnectTrigger implements INodeType {
 		let isClosed = false;
 		let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 		let currentBearerToken = '';
+		let tokenRefreshInFlight: Promise<string> | null = null;
+		let connectionFlowInFlight: Promise<void> | null = null;
 
 		const websocketUrl           = this.getNodeParameter('websocketUrl', '') as string;
 		const authentication         = this.getNodeParameter('authentication', 'none') as string;
@@ -680,6 +683,40 @@ export class WebsocketReconnectTrigger implements INodeType {
 			return rawToken;
 		};
 
+		const getTokenForConnection = async (useFullRefresh = false): Promise<string> => {
+			if (tokenRefreshInFlight) {
+				return tokenRefreshInFlight;
+			}
+
+			tokenRefreshInFlight = (async () => {
+				const token = useFullRefresh ? await fetchFreshToken() : await fetchLatestToken();
+				if (!token || !token.trim()) {
+					throw new NodeOperationError(this.getNode(), 'Token refresh returned an empty token, aborting WebSocket handshake.');
+				}
+				return token;
+			})();
+
+			try {
+				return await tokenRefreshInFlight;
+			} finally {
+				tokenRefreshInFlight = null;
+			}
+		};
+
+		const runExclusiveConnectionFlow = async (flow: () => Promise<void>): Promise<void> => {
+			while (connectionFlowInFlight) {
+				await connectionFlowInFlight;
+			}
+
+			const currentFlow = flow().finally(() => {
+				if (connectionFlowInFlight === currentFlow) {
+					connectionFlowInFlight = null;
+				}
+			});
+			connectionFlowInFlight = currentFlow;
+			await currentFlow;
+		};
+
 		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string> }> => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
@@ -710,7 +747,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				const targetParam = this.getNodeParameter('tokenRefreshTargetParam', 'Authorization') as string;
 				const headerName = this.getNodeParameter('tokenRefreshHeaderName', 'X-API-Key') as string;
 				const tokenPrefix = this.getNodeParameter('tokenRefreshValuePrefix', 'Bearer ') as string;
-				const freshToken = useFullRefresh ? await fetchFreshToken() : await fetchLatestToken();
+				const freshToken = await getTokenForConnection(useFullRefresh);
 				const injected = injectTokenIntoConnection({
 					injectionMethod: tokenInjectionMethod,
 					token: freshToken,
@@ -801,50 +838,52 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 		// Overlap refresh: connect new WS before closing old one
 		const doOverlapRefresh = async () => {
-			console.debug('[websocket-ws] overlap token refresh starting');
-			// Mark current WS as silently-closeable NOW — server may close it as soon
-			// as the new connection arrives, before newWs fires 'open'.
-			const outgoingWs = ws;
-			if (outgoingWs) silentCloseInstances.add(outgoingWs);
+			await runExclusiveConnectionFlow(async () => {
+				console.debug('[websocket-ws] overlap token refresh starting');
+				// Mark current WS as silently-closeable NOW — server may close it as soon
+				// as the new connection arrives, before newWs fires 'open'.
+				const outgoingWs = ws;
+				if (outgoingWs) silentCloseInstances.add(outgoingWs);
 
-			try {
-				const { url, headers } = await buildConnectionOptions(true);
-				const newWs = new WebSocket(url, { headers });
+				try {
+					const { url, headers } = await buildConnectionOptions(true);
+					const newWs = new WebSocket(url, { headers });
 
-				newWs.once('error', (error: Error) => {
-					console.warn('[websocket-ws] overlap new connection failed, keeping old:', error.message);
-					// New connection failed — remove silent mark so old WS close still triggers reconnect
+					newWs.once('error', (error: Error) => {
+						console.warn('[websocket-ws] overlap new connection failed, keeping old:', error.message);
+						// New connection failed — remove silent mark so old WS close still triggers reconnect
+						if (outgoingWs) silentCloseInstances.delete(outgoingWs);
+						newWs.terminate();
+						scheduleTokenRefresh(); // retry after interval
+					});
+
+					newWs.once('open', () => {
+						console.debug('[websocket-ws] overlap new connection open, closing old');
+						ws = newWs;
+						setupWsEvents(newWs);
+						if (outgoingWs) {
+							silentCloseInstances.add(outgoingWs); // ensure still marked
+							outgoingWs.terminate();
+						}
+						reconnectAttempts = 0;
+						if (sendInitMessage) {
+							newWs.send(this.getNodeParameter('initMessage', '') as string);
+						}
+						this.emit([this.helpers.returnJsonArray([{
+							event: 'open',
+							bearerToken: currentBearerToken || null,
+							ws: returnWs ? newWs : null,
+						}])]);
+						emitTokenRefreshed();
+						scheduleTokenRefresh();
+					});
+				} catch (error: unknown) {
 					if (outgoingWs) silentCloseInstances.delete(outgoingWs);
-					newWs.terminate();
-					scheduleTokenRefresh(); // retry after interval
-				});
-
-				newWs.once('open', () => {
-					console.debug('[websocket-ws] overlap new connection open, closing old');
-					ws = newWs;
-					setupWsEvents(newWs);
-					if (outgoingWs) {
-						silentCloseInstances.add(outgoingWs); // ensure still marked
-						outgoingWs.terminate();
-					}
-					reconnectAttempts = 0;
-					if (sendInitMessage) {
-						newWs.send(this.getNodeParameter('initMessage', '') as string);
-					}
-					this.emit([this.helpers.returnJsonArray([{
-						event: 'open',
-						bearerToken: currentBearerToken || null,
-						ws: returnWs ? newWs : null,
-					}])]);
-					emitTokenRefreshed();
+					const msg = error instanceof Error ? error.message : String(error);
+					console.warn('[websocket-ws] overlap refresh error:', msg);
 					scheduleTokenRefresh();
-				});
-			} catch (error: unknown) {
-				if (outgoingWs) silentCloseInstances.delete(outgoingWs);
-				const msg = error instanceof Error ? error.message : String(error);
-				console.warn('[websocket-ws] overlap refresh error:', msg);
-				scheduleTokenRefresh();
-			}
+				}
+			});
 		};
 
 		const scheduleTokenRefresh = () => {
@@ -856,14 +895,16 @@ export class WebsocketReconnectTrigger implements INodeType {
 		};
 
 		const startConsumer = async (): Promise<void> => {
-			try {
-				const { url, headers } = await buildConnectionOptions();
-				ws = new WebSocket(url, { headers });
-				setupWsEvents(ws);
-			} catch (error: unknown) {
-				const msg = error instanceof Error ? error.message : String(error);
-				throw new NodeOperationError(this.getNode(), `Execution error: ${msg}`);
-			}
+			await runExclusiveConnectionFlow(async () => {
+				try {
+					const { url, headers } = await buildConnectionOptions();
+					ws = new WebSocket(url, { headers });
+					setupWsEvents(ws);
+				} catch (error: unknown) {
+					const msg = error instanceof Error ? error.message : String(error);
+					throw new NodeOperationError(this.getNode(), `Execution error: ${msg}`);
+				}
+			});
 		};
 
 		await startConsumer();
