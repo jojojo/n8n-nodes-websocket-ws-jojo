@@ -579,11 +579,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 		const emitDebug = (step: string, data: Record<string, unknown>) => {
 			if (!debugMode) return;
-			this.emit([this.helpers.returnJsonArray([{
-				event: 'debug',
-				step,
-				...data,
-			}])]);
+			console.debug('[websocket-ws][debug]', step, JSON.stringify(data));
 		};
 
 		// Fetch step-1 token only (GET latest active token) — used for initial connect and reconnect-on-drop
@@ -845,14 +841,14 @@ export class WebsocketReconnectTrigger implements INodeType {
 						responseBody: body || null,
 					};
 					this.emit([this.helpers.returnJsonArray([payload])]);
-					emitDebug('wsUnexpectedResponse', payload);
+					console.debug('[websocket-ws][debug] wsUnexpectedResponse', JSON.stringify(payload));
 				});
 			});
 
 			wsInstance.on('error', (error: Error) => {
 				console.warn('[websocket-ws] connection error:', error.message);
 				this.emit([this.helpers.returnJsonArray([{ event: 'error', message: error.message }])]);
-				emitDebug('wsError', { message: error.message });
+				console.debug('[websocket-ws][debug] wsError', error.message);
 			});
 
 			wsInstance.on('close', () => {
