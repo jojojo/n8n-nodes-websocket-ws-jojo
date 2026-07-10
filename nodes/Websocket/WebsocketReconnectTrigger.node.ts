@@ -90,7 +90,11 @@ function injectTokenIntoConnection(params: {
 		headerName,
 	} = params;
 
-	const injectedValue = `${prefix}${token}`;
+	const normalizedToken = token.trim();
+	const normalizedPrefix = prefix || '';
+	const injectedValue = normalizedPrefix && normalizedToken.startsWith(normalizedPrefix)
+		? normalizedToken
+		: `${normalizedPrefix}${normalizedToken}`;
 	const nextHeaders = { ...headers };
 	let nextUrl = url;
 
@@ -222,7 +226,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Token Refresh URL',
 				name: 'tokenRefreshUrl',
 				type: 'string',
-				typeOptions: { password: true },
 				default: '',
 				placeholder: 'https://api.example.com/auth/token',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'] } },
@@ -279,6 +282,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				name: 'tokenRefreshBodyType',
 				type: 'options',
 				options: [
+					{ name: 'Form URL Encoded (Application/X-Www-Form-Urlencoded)', value: 'formUrlEncoded' },
 					{ name: 'Form Data (Multipart/form-Data)', value: 'formData' },
 					{ name: 'JSON', value: 'json' },
 					{ name: 'No Body', value: 'none' },
@@ -332,7 +336,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Token Field in Response',
 				name: 'tokenRefreshResponsePath',
 				type: 'string',
-				typeOptions: { password: true },
 				default: '',
 				placeholder: 'token   or   data.access_token',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['direct'] } },
@@ -345,7 +348,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Step 1 - Fetch Current Token URL',
 				name: 'tsStep1Url',
 				type: 'string',
-				typeOptions: { password: true },
 				default: '',
 				placeholder: 'https://api.example.com/api/token/latest',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
@@ -374,7 +376,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Step 1 - Token Field in Response',
 				name: 'tsStep1ResponsePath',
 				type: 'string',
-				typeOptions: { password: true },
 				default: '',
 				placeholder: 'token   or   data.bearer',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
@@ -385,7 +386,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Step 2 - Refresh URL',
 				name: 'tsStep2Url',
 				type: 'string',
-				typeOptions: { password: true },
 				default: '',
 				placeholder: 'https://api.example.com/api/token/refresh',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
@@ -395,7 +395,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Step 2 - New Token Field in Response',
 				name: 'tsStep2ResponsePath',
 				type: 'string',
-				typeOptions: { password: true },
 				default: '',
 				placeholder: 'token   or   data.new_token',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenRefreshMode: ['twoStep'] } },
@@ -420,7 +419,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'WebSocket Query Param to Inject',
 				name: 'tokenRefreshTargetParam',
 				type: 'string',
-				typeOptions: { password: true },
 				default: 'Authorization',
 				placeholder: 'Authorization',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenInjectionMethod: ['queryParameter'] } },
@@ -430,7 +428,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Header Name',
 				name: 'tokenRefreshHeaderName',
 				type: 'string',
-				typeOptions: { password: true },
 				default: 'X-API-Key',
 				placeholder: 'X-API-Key',
 				displayOptions: { show: { tokenRefreshEnabled: [true], tokenInjectionMethod: ['customHeader'] } },
@@ -440,7 +437,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 				displayName: 'Token Prefix',
 				name: 'tokenRefreshValuePrefix',
 				type: 'string',
-				typeOptions: { password: true },
 				default: 'Bearer ',
 				placeholder: 'Bearer ',
 				displayOptions: { show: { tokenRefreshEnabled: [true] } },
@@ -655,7 +651,21 @@ export class WebsocketReconnectTrigger implements INodeType {
 			let requestBody: Buffer | string | undefined;
 			if (refreshMethod === 'POST') {
 				const bodyType = this.getNodeParameter('tokenRefreshBodyType', 'formData') as string;
-				if (bodyType === 'formData') {
+				if (bodyType === 'formUrlEncoded') {
+					const formFieldsParam = this.getNodeParameter('tokenRefreshFormFields', {}) as {
+						fields?: Array<{ name: string; value: string }>;
+					};
+					const urlEncodedBody = new URLSearchParams();
+					for (const field of formFieldsParam.fields || []) {
+						if (field.name) {
+							urlEncodedBody.append(field.name, field.value ?? '');
+						}
+					}
+					const bodyString = urlEncodedBody.toString();
+					reqHeaders['Content-Type'] = 'application/x-www-form-urlencoded';
+					reqHeaders['Content-Length'] = String(Buffer.byteLength(bodyString));
+					requestBody = bodyString;
+				} else if (bodyType === 'formData') {
 					const formFieldsParam = this.getNodeParameter('tokenRefreshFormFields', {}) as {
 						fields?: Array<{ name: string; value: string }>;
 					};
