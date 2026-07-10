@@ -81,6 +81,44 @@ function sanitizeUrlForDebug(inputUrl: string): string {
 	}
 }
 
+function base64UrlDecode(input: string): string {
+	const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+	const padLength = (4 - (normalized.length % 4)) % 4;
+	return Buffer.from(normalized + '='.repeat(padLength), 'base64').toString('utf8');
+}
+
+function getTokenDiagnostics(token: string): Record<string, unknown> {
+	const trimmed = token.trim();
+	const parts = trimmed.split('.');
+	const isLikelyJwt = parts.length === 3;
+	const diagnostics: Record<string, unknown> = {
+		tokenLength: trimmed.length,
+		isLikelyJwt,
+		containsWhitespace: trimmed !== token,
+	};
+
+	if (!isLikelyJwt) {
+		return diagnostics;
+	}
+
+	try {
+		const payloadRaw = base64UrlDecode(parts[1]);
+		const payload = JSON.parse(payloadRaw) as Record<string, unknown>;
+		diagnostics.jwt = {
+			iss: payload.iss ?? null,
+			aud: payload.aud ?? null,
+			exp: payload.exp ?? null,
+			nbf: payload.nbf ?? null,
+			iat: payload.iat ?? null,
+			scope: payload.scope ?? payload.scp ?? null,
+		};
+	} catch {
+		diagnostics.jwtParseError = true;
+	}
+
+	return diagnostics;
+}
+
 type TokenInjectionMethod = 'authorizationHeader' | 'queryParameter' | 'customHeader';
 
 function injectTokenIntoConnection(params: {
@@ -559,6 +597,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		let isClosed = false;
 		let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 		let currentBearerToken = '';
+		let currentRawAccessToken = '';
 		let tokenRefreshInFlight: Promise<string> | null = null;
 		let connectionFlowInFlight: Promise<void> | null = null;
 
@@ -802,6 +841,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					headers[key] = value;
 				}
 				url = injected.url;
+				currentRawAccessToken = freshToken;
 				currentBearerToken = injected.injectedValue;
 				const injectionTarget = tokenInjectionMethod === 'queryParameter'
 					? `query:${targetParam}`
@@ -832,6 +872,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				let body = '';
 				response.on('data', (chunk: Buffer) => { body += chunk.toString(); });
 				response.on('end', () => {
+					const tokenDiagnostics = getTokenDiagnostics(currentRawAccessToken);
 					const payload = {
 						event: 'error',
 						message: `Unexpected server response: ${response.statusCode ?? 'unknown'}`,
@@ -839,6 +880,11 @@ export class WebsocketReconnectTrigger implements INodeType {
 						statusMessage: response.statusMessage ?? null,
 						responseHeaders: response.headers,
 						responseBody: body || null,
+						authDiagnostics: {
+							hasAuthorizationHeader: currentBearerToken.length > 0,
+							headerPrefix: currentBearerToken ? currentBearerToken.split(' ')[0] : null,
+							tokenDiagnostics,
+						},
 					};
 					this.emit([this.helpers.returnJsonArray([payload])]);
 					console.debug('[websocket-ws][debug] wsUnexpectedResponse', JSON.stringify(payload));
