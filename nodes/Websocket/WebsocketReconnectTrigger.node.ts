@@ -69,6 +69,43 @@ function extractByPath(data: unknown, path: string): string {
 	return String(value);
 }
 
+type TokenInjectionMethod = 'authorizationHeader' | 'queryParameter' | 'customHeader';
+
+function injectTokenIntoConnection(params: {
+	injectionMethod: TokenInjectionMethod;
+	token: string;
+	headers: Record<string, string>;
+	url: string;
+	prefix: string;
+	parameterName: string;
+	headerName: string;
+}): { headers: Record<string, string>; url: string; injectedValue: string } {
+	const {
+		injectionMethod,
+		token,
+		headers,
+		url,
+		prefix,
+		parameterName,
+		headerName,
+	} = params;
+
+	const injectedValue = `${prefix}${token}`;
+	const nextHeaders = { ...headers };
+	let nextUrl = url;
+
+	if (injectionMethod === 'authorizationHeader') {
+		nextHeaders.Authorization = injectedValue;
+	} else if (injectionMethod === 'customHeader') {
+		nextHeaders[headerName || 'X-API-Key'] = injectedValue;
+	} else {
+		const sep = nextUrl.includes('?') ? '&' : '?';
+		nextUrl = `${nextUrl}${sep}${encodeURIComponent(parameterName || 'Authorization')}=${encodeURIComponent(injectedValue)}`;
+	}
+
+	return { headers: nextHeaders, url: nextUrl, injectedValue };
+}
+
 export class WebsocketReconnectTrigger implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Websocket Reconnect - Trigger',
@@ -367,14 +404,36 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 			// ── SHARED (both modes) ─────────────────────────────────────
 			{
+				displayName: 'Token Injection Method',
+				name: 'tokenInjectionMethod',
+				type: 'options',
+				options: [
+					{ name: 'Authorization Header', value: 'authorizationHeader' },
+					{ name: 'Query Parameter', value: 'queryParameter' },
+					{ name: 'Custom Header', value: 'customHeader' },
+				],
+				default: 'queryParameter',
+				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				description: 'How to inject the refreshed token into the WebSocket handshake',
+			},
+			{
 				displayName: 'WebSocket Query Param to Inject',
 				name: 'tokenRefreshTargetParam',
 				type: 'string',
 				typeOptions: { password: true },
 				default: 'Authorization',
 				placeholder: 'Authorization',
-				displayOptions: { show: { tokenRefreshEnabled: [true] } },
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenInjectionMethod: ['queryParameter'] } },
 				description: 'Name of the query parameter that will receive the fresh token',
+			},
+			{
+				displayName: 'Header Name',
+				name: 'tokenRefreshHeaderName',
+				type: 'string',
+				default: 'X-API-Key',
+				placeholder: 'X-API-Key',
+				displayOptions: { show: { tokenRefreshEnabled: [true], tokenInjectionMethod: ['customHeader'] } },
+				description: 'Header name used when Token Injection Method is set to Custom Header',
 			},
 			{
 				displayName: 'Token Prefix',
@@ -502,7 +561,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 		// Fetch step-1 token only (GET latest active token) — used for initial connect and reconnect-on-drop
 		const fetchLatestToken = async (): Promise<string> => {
 			const refreshMode = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
-			const valuePrefix = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
 
 			if (refreshMode === 'twoStep') {
 				const step1Url              = this.getNodeParameter('tsStep1Url', '') as string;
@@ -524,7 +582,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 						`Two-step token (step 1): could not find field "${step1ResponsePath}" in response. Full response: ${JSON.stringify(step1Data)}`,
 					);
 				}
-				return `${valuePrefix}${currentToken}`;
+				return currentToken;
 			}
 
 			// direct mode: same single-endpoint fetch
@@ -533,7 +591,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 
 		const fetchFreshToken = async (): Promise<string> => {
 			const refreshMode   = this.getNodeParameter('tokenRefreshMode', 'direct') as string;
-			const valuePrefix   = this.getNodeParameter('tokenRefreshValuePrefix', '') as string;
 
 			// ── TWO-STEP MODE ────────────────────────────────────────────
 			if (refreshMode === 'twoStep') {
@@ -576,7 +633,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 						`Two-step token refresh (step 2): could not find field "${step2ResponsePath}" in response. Full response: ${JSON.stringify(step2Data)}`,
 					);
 				}
-				return `${valuePrefix}${newToken}`;
+				return newToken;
 			}
 
 			// ── DIRECT MODE ──────────────────────────────────────────────
@@ -620,7 +677,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					`Token refresh: could not find field "${responsePath}" in response. Full response: ${JSON.stringify(data)}`,
 				);
 			}
-			return `${valuePrefix}${rawToken}`;
+			return rawToken;
 		};
 
 		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string> }> => {
@@ -649,12 +706,31 @@ export class WebsocketReconnectTrigger implements INodeType {
 			}
 
 			if (tokenRefreshEnabled) {
+				const tokenInjectionMethod = this.getNodeParameter('tokenInjectionMethod', 'queryParameter') as TokenInjectionMethod;
 				const targetParam = this.getNodeParameter('tokenRefreshTargetParam', 'Authorization') as string;
+				const headerName = this.getNodeParameter('tokenRefreshHeaderName', 'X-API-Key') as string;
+				const tokenPrefix = this.getNodeParameter('tokenRefreshValuePrefix', 'Bearer ') as string;
 				const freshToken = useFullRefresh ? await fetchFreshToken() : await fetchLatestToken();
-				currentBearerToken = freshToken;
-				const sep = url.includes('?') ? '&' : '?';
-				url = `${url}${sep}${encodeURIComponent(targetParam)}=${encodeURIComponent(freshToken)}`;
-				console.debug('[websocket-ws] token refreshed, injected into', targetParam);
+				const injected = injectTokenIntoConnection({
+					injectionMethod: tokenInjectionMethod,
+					token: freshToken,
+					headers,
+					url,
+					prefix: tokenPrefix,
+					parameterName: targetParam,
+					headerName,
+				});
+				for (const [key, value] of Object.entries(injected.headers)) {
+					headers[key] = value;
+				}
+				url = injected.url;
+				currentBearerToken = injected.injectedValue;
+				const injectionTarget = tokenInjectionMethod === 'queryParameter'
+					? `query:${targetParam}`
+					: tokenInjectionMethod === 'customHeader'
+						? `header:${headerName || 'X-API-Key'}`
+						: 'header:Authorization';
+				console.debug('[websocket-ws] token refreshed, injected into', injectionTarget);
 			}
 
 			return { url, headers };
