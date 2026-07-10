@@ -26,11 +26,14 @@ function buildMultipart(fields: Array<{ name: string; value: string }>): { body:
 	return { body: Buffer.concat(parts), boundary };
 }
 
+type NetworkTrace = { enabled: boolean; label: string };
+
 function doRequest(
 	url: string,
 	method: string,
 	headers: Record<string, string>,
 	body?: Buffer | string,
+	trace?: NetworkTrace,
 ): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const isHttps = url.startsWith('https://');
@@ -40,11 +43,27 @@ function doRequest(
 			headers,
 			...(isHttps ? { rejectUnauthorized: false } : {}),
 		};
+		if (trace?.enabled) {
+			console.debug('[websocket-ws][trace]', trace.label, 'request', JSON.stringify({
+				url: sanitizeUrlForDebug(url),
+				method,
+				headers: redactHeadersForDebug(headers),
+				body: redactBodyForDebug(body, headers['Content-Type']),
+			}));
+		}
 		const req = client.request(url, options, (res) => {
 			let raw = '';
 			res.on('data', (chunk: Buffer) => { raw += chunk.toString(); });
 			res.on('end', () => {
 				const status = res.statusCode ?? 0;
+				if (trace?.enabled) {
+					console.debug('[websocket-ws][trace]', trace.label, 'response', JSON.stringify({
+						status,
+						statusMessage: res.statusMessage ?? null,
+						headers: redactHeadersForDebug(Object.fromEntries(Object.entries(res.headers).map(([key, value]) => [key, Array.isArray(value) ? value.join(',') : String(value ?? '')]))),
+						body: redactTextForDebug(raw),
+					}));
+				}
 				if (status < 200 || status >= 300) {
 					reject(new Error(`Token refresh HTTP ${status}: ${raw}`));
 					return;
@@ -79,6 +98,64 @@ function sanitizeUrlForDebug(inputUrl: string): string {
 	} catch {
 		return inputUrl;
 	}
+}
+
+function redactHeadersForDebug(headers: Record<string, string>): Record<string, string> {
+	const sensitiveHeaderNames = new Set([
+		'authorization',
+		'cookie',
+		'set-cookie',
+		'x-api-key',
+		'x-auth-token',
+		'proxy-authorization',
+	]);
+	const redacted: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		redacted[key] = sensitiveHeaderNames.has(key.toLowerCase()) ? '<redacted>' : value;
+	}
+	return redacted;
+}
+
+function redactTextForDebug(input: string): string {
+	const trimmed = input.trim();
+	if (!trimmed) return input;
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		const redact = (value: unknown): unknown => {
+			if (Array.isArray(value)) return value.map(redact);
+			if (!value || typeof value !== 'object') return value;
+			const output: Record<string, unknown> = {};
+			for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+				if (/secret|token|password|authorization|client_secret/i.test(key)) {
+					output[key] = '<redacted>';
+				} else {
+					output[key] = redact(nested);
+				}
+			}
+			return output;
+		};
+		return JSON.stringify(redact(parsed));
+	} catch {
+		return trimmed.length > 160 ? `${trimmed.slice(0, 80)}...${trimmed.slice(-40)}` : trimmed;
+	}
+}
+
+function redactBodyForDebug(body?: Buffer | string, contentType?: string): string | null {
+	if (body === undefined) return null;
+	const text = Buffer.isBuffer(body) ? body.toString('utf8') : body;
+	if (!text) return null;
+	if (contentType?.includes('application/x-www-form-urlencoded')) {
+		const params = new URLSearchParams(text);
+		const redactedParams = new URLSearchParams();
+		for (const [key, value] of params.entries()) {
+			redactedParams.set(key, /secret|token|password|authorization/i.test(key) ? '<redacted>' : value);
+		}
+		return redactedParams.toString();
+	}
+	if (contentType?.includes('application/json')) {
+		return redactTextForDebug(text);
+	}
+	return text.length > 160 ? `${text.slice(0, 80)}...${text.slice(-40)}` : text;
 }
 
 function base64UrlDecode(input: string): string {
@@ -606,7 +683,6 @@ export class WebsocketReconnectTrigger implements INodeType {
 		let isClosed = false;
 		let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 		let currentBearerToken = '';
-		let currentRawAccessToken = '';
 		let tokenRefreshInFlight: Promise<string> | null = null;
 		let connectionFlowInFlight: Promise<void> | null = null;
 
@@ -644,7 +720,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					'accept': 'application/json',
 					[step1AdminHeaderName]: step1AdminHeaderValue,
 				};
-				const step1Data = await doRequest(step1Url, 'GET', step1Headers);
+				const step1Data = await doRequest(step1Url, 'GET', step1Headers, undefined, { enabled: debugMode, label: 'token.twoStep.step1.latest' });
 				console.debug('[websocket-ws] two-step step1 (latest) response:', JSON.stringify(step1Data));
 
 				const currentToken = extractByPath(step1Data, step1ResponsePath);
@@ -676,7 +752,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					'accept': 'application/json',
 					[step1AdminHeaderName]: step1AdminHeaderValue,
 				};
-				const step1Data = await doRequest(step1Url, 'GET', step1Headers);
+				const step1Data = await doRequest(step1Url, 'GET', step1Headers, undefined, { enabled: debugMode, label: 'token.twoStep.step1.refresh' });
 				console.debug('[websocket-ws] two-step step1 response:', JSON.stringify(step1Data));
 
 				const currentToken = extractByPath(step1Data, step1ResponsePath);
@@ -695,7 +771,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					'accept': 'application/json',
 					'Authorization': `Bearer ${currentToken}`,
 				};
-				const step2Data = await doRequest(step2Url, 'POST', step2Headers);
+				const step2Data = await doRequest(step2Url, 'POST', step2Headers, undefined, { enabled: debugMode, label: 'token.twoStep.step2.refresh' });
 				console.debug('[websocket-ws] two-step step2 response:', JSON.stringify(step2Data));
 
 				const newToken = extractByPath(step2Data, step2ResponsePath);
@@ -754,7 +830,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				}
 			}
 
-			const data = await doRequest(refreshUrl, refreshMethod, reqHeaders, requestBody);
+			const data = await doRequest(refreshUrl, refreshMethod, reqHeaders, requestBody, { enabled: debugMode, label: 'token.direct.refresh' });
 			console.debug('[websocket-ws] token refresh response:', JSON.stringify(data));
 			const rawToken = extractByPath(data, responsePath);
 			if (!rawToken || rawToken === 'undefined' || rawToken === 'null') {
@@ -800,10 +876,11 @@ export class WebsocketReconnectTrigger implements INodeType {
 			await currentFlow;
 		};
 
-		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string>; bearerToken: string | null }> => {
+		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string>; bearerToken: string | null; rawAccessToken: string | null }> => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
 			let bearerToken: string | null = null;
+			let rawAccessToken: string | null = null;
 
 			if (authentication === 'headerAuth') {
 				const creds = await this.getCredentials('websocketHeaderAuthApi') as ICredentialDataDecryptedObject;
@@ -851,7 +928,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					headers[key] = value;
 				}
 				url = injected.url;
-				currentRawAccessToken = freshToken;
+					rawAccessToken = freshToken;
 				currentBearerToken = injected.injectedValue;
 				bearerToken = injected.injectedValue;
 				const injectionTarget = tokenInjectionMethod === 'queryParameter'
@@ -862,7 +939,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				console.debug('[websocket-ws] token refreshed, injected into', injectionTarget);
 			}
 
-			return { url, headers, bearerToken };
+			return { url, headers, bearerToken, rawAccessToken };
 		};
 
 		// Per-instance set: WS instances that should close silently (no event, no reconnect)
@@ -878,12 +955,12 @@ export class WebsocketReconnectTrigger implements INodeType {
 			}])]);
 		};
 
-		const setupWsEvents = (wsInstance: WebSocket, connectionBearerToken: string | null) => {
+		const setupWsEvents = (wsInstance: WebSocket, connectionBearerToken: string | null, connectionRawAccessToken: string | null) => {
 			wsInstance.on('unexpected-response', (_request, response) => {
 				let body = '';
 				response.on('data', (chunk: Buffer) => { body += chunk.toString(); });
 				response.on('end', () => {
-					const tokenDiagnostics = getTokenDiagnostics(currentRawAccessToken);
+					const tokenDiagnostics = getTokenDiagnostics(connectionRawAccessToken || '');
 					const payload = {
 						event: 'error',
 						message: `Unexpected server response: ${response.statusCode ?? 'unknown'}`,
@@ -967,7 +1044,16 @@ export class WebsocketReconnectTrigger implements INodeType {
 				if (outgoingWs) silentCloseInstances.add(outgoingWs);
 
 				try {
-					const { url, headers, bearerToken } = await buildConnectionOptions(true);
+					const { url, headers, bearerToken, rawAccessToken } = await buildConnectionOptions(true);
+					if (debugMode) {
+						console.debug('[websocket-ws][trace]', 'ws.overlap.connect', JSON.stringify({
+							url: sanitizeUrlForDebug(url),
+							headers: redactHeadersForDebug(headers),
+							bearerTokenLength: bearerToken ? bearerToken.length : 0,
+							bearerTokenHash: bearerToken ? hashPreview(bearerToken) : null,
+							rawAccessTokenLength: rawAccessToken ? rawAccessToken.length : 0,
+						}));
+					}
 					const newWs = new WebSocket(url, { headers });
 
 					newWs.once('error', (error: Error) => {
@@ -981,7 +1067,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					newWs.once('open', () => {
 						console.debug('[websocket-ws] overlap new connection open, closing old');
 						ws = newWs;
-						setupWsEvents(newWs, bearerToken);
+						setupWsEvents(newWs, bearerToken, rawAccessToken);
 						if (outgoingWs) {
 							silentCloseInstances.add(outgoingWs); // ensure still marked
 							outgoingWs.terminate();
@@ -1018,7 +1104,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const startConsumer = async (): Promise<void> => {
 			await runExclusiveConnectionFlow(async () => {
 				try {
-					const { url, headers, bearerToken } = await buildConnectionOptions();
+					const { url, headers, bearerToken, rawAccessToken } = await buildConnectionOptions();
 					emitDebug('wsHandshakePrepared', {
 						url: sanitizeUrlForDebug(url),
 						headerKeys: Object.keys(headers),
@@ -1027,8 +1113,17 @@ export class WebsocketReconnectTrigger implements INodeType {
 							? headers.Authorization.split(' ')[0]
 							: null,
 					});
+					if (debugMode) {
+						console.debug('[websocket-ws][trace]', 'ws.connect', JSON.stringify({
+							url: sanitizeUrlForDebug(url),
+							headers: redactHeadersForDebug(headers),
+							bearerTokenLength: bearerToken ? bearerToken.length : 0,
+							bearerTokenHash: bearerToken ? hashPreview(bearerToken) : null,
+							rawAccessTokenLength: rawAccessToken ? rawAccessToken.length : 0,
+						}));
+					}
 					ws = new WebSocket(url, { headers });
-					setupWsEvents(ws, bearerToken);
+					setupWsEvents(ws, bearerToken, rawAccessToken);
 				} catch (error: unknown) {
 					const msg = error instanceof Error ? error.message : String(error);
 					throw new NodeOperationError(this.getNode(), `Execution error: ${msg}`);

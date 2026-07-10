@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-websocket-ws-jojo",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "description": "WebSocket trigger for n8n with header/query auth and auto-reconnect",
   "keywords": [
     "n8n-community-node-package"
