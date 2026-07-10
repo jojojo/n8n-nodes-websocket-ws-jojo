@@ -69,6 +69,18 @@ function extractByPath(data: unknown, path: string): string {
 	return String(value);
 }
 
+function sanitizeUrlForDebug(inputUrl: string): string {
+	try {
+		const parsed = new URL(inputUrl);
+		for (const key of parsed.searchParams.keys()) {
+			parsed.searchParams.set(key, '***');
+		}
+		return parsed.toString();
+	} catch {
+		return inputUrl;
+	}
+}
+
 type TokenInjectionMethod = 'authorizationHeader' | 'queryParameter' | 'customHeader';
 
 function injectTokenIntoConnection(params: {
@@ -531,6 +543,13 @@ export class WebsocketReconnectTrigger implements INodeType {
 				default: false,
 				description: 'Whether to include the raw ws object in output (needed to send reply messages)',
 			},
+			{
+				displayName: 'Debug Mode',
+				name: 'debugMode',
+				type: 'boolean',
+				default: false,
+				description: 'Whether to emit additional debug events to help diagnose authentication and handshake issues',
+			},
 		],
 	};
 
@@ -547,6 +566,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const authentication         = this.getNodeParameter('authentication', 'none') as string;
 		const sendInitMessage        = this.getNodeParameter('sendInitMessage', false) as boolean;
 		const returnWs               = this.getNodeParameter('returnWs', false) as boolean;
+		const debugMode              = this.getNodeParameter('debugMode', false) as boolean;
 		const autoReconnect          = this.getNodeParameter('autoReconnect', true) as boolean;
 		const reconnectInterval      = (this.getNodeParameter('reconnectInterval', 10) as number) * 1000;
 		const maxReconnects          = this.getNodeParameter('maxReconnectAttempts', 0) as number;
@@ -556,6 +576,15 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const tokenRefreshIntervalUnit  = this.getNodeParameter('tokenRefreshIntervalUnit', 'hours') as string;
 		const unitMs = tokenRefreshIntervalUnit === 'seconds' ? 1000 : tokenRefreshIntervalUnit === 'minutes' ? 60_000 : 3_600_000;
 		const tokenRefreshIntervalMs = tokenRefreshIntervalValue * unitMs;
+
+		const emitDebug = (step: string, data: Record<string, unknown>) => {
+			if (!debugMode) return;
+			this.emit([this.helpers.returnJsonArray([{
+				event: 'debug',
+				step,
+				...data,
+			}])]);
+		};
 
 		// Fetch step-1 token only (GET latest active token) — used for initial connect and reconnect-on-drop
 		const fetchLatestToken = async (): Promise<string> => {
@@ -758,6 +787,12 @@ export class WebsocketReconnectTrigger implements INodeType {
 				const headerName = this.getNodeParameter('tokenRefreshHeaderName', 'X-API-Key') as string;
 				const tokenPrefix = this.getNodeParameter('tokenRefreshValuePrefix', 'Bearer ') as string;
 				const freshToken = await getTokenForConnection(useFullRefresh);
+				emitDebug('tokenResolved', {
+					useFullRefresh,
+					tokenLength: freshToken.length,
+					hasWhitespace: freshToken !== freshToken.trim(),
+					injectionMethod: tokenInjectionMethod,
+				});
 				const injected = injectTokenIntoConnection({
 					injectionMethod: tokenInjectionMethod,
 					token: freshToken,
@@ -797,9 +832,27 @@ export class WebsocketReconnectTrigger implements INodeType {
 		};
 
 		const setupWsEvents = (wsInstance: WebSocket) => {
+			wsInstance.on('unexpected-response', (_request, response) => {
+				let body = '';
+				response.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+				response.on('end', () => {
+					const payload = {
+						event: 'error',
+						message: `Unexpected server response: ${response.statusCode ?? 'unknown'}`,
+						statusCode: response.statusCode ?? null,
+						statusMessage: response.statusMessage ?? null,
+						responseHeaders: response.headers,
+						responseBody: body || null,
+					};
+					this.emit([this.helpers.returnJsonArray([payload])]);
+					emitDebug('wsUnexpectedResponse', payload);
+				});
+			});
+
 			wsInstance.on('error', (error: Error) => {
 				console.warn('[websocket-ws] connection error:', error.message);
 				this.emit([this.helpers.returnJsonArray([{ event: 'error', message: error.message }])]);
+				emitDebug('wsError', { message: error.message });
 			});
 
 			wsInstance.on('close', () => {
@@ -908,6 +961,14 @@ export class WebsocketReconnectTrigger implements INodeType {
 			await runExclusiveConnectionFlow(async () => {
 				try {
 					const { url, headers } = await buildConnectionOptions();
+					emitDebug('wsHandshakePrepared', {
+						url: sanitizeUrlForDebug(url),
+						headerKeys: Object.keys(headers),
+						hasAuthorizationHeader: Boolean(headers.Authorization),
+						authorizationPrefix: headers.Authorization
+							? headers.Authorization.split(' ')[0]
+							: null,
+					});
 					ws = new WebSocket(url, { headers });
 					setupWsEvents(ws);
 				} catch (error: unknown) {
