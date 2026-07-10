@@ -791,9 +791,10 @@ export class WebsocketReconnectTrigger implements INodeType {
 			await currentFlow;
 		};
 
-		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string> }> => {
+		const buildConnectionOptions = async (useFullRefresh = false): Promise<{ url: string; headers: Record<string, string>; bearerToken: string | null }> => {
 			let url = websocketUrl;
 			const headers: Record<string, string> = {};
+			let bearerToken: string | null = null;
 
 			if (authentication === 'headerAuth') {
 				const creds = await this.getCredentials('websocketHeaderAuthApi') as ICredentialDataDecryptedObject;
@@ -843,6 +844,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				url = injected.url;
 				currentRawAccessToken = freshToken;
 				currentBearerToken = injected.injectedValue;
+				bearerToken = injected.injectedValue;
 				const injectionTarget = tokenInjectionMethod === 'queryParameter'
 					? `query:${targetParam}`
 					: tokenInjectionMethod === 'customHeader'
@@ -851,7 +853,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				console.debug('[websocket-ws] token refreshed, injected into', injectionTarget);
 			}
 
-			return { url, headers };
+			return { url, headers, bearerToken };
 		};
 
 		// Per-instance set: WS instances that should close silently (no event, no reconnect)
@@ -867,7 +869,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 			}])]);
 		};
 
-		const setupWsEvents = (wsInstance: WebSocket) => {
+		const setupWsEvents = (wsInstance: WebSocket, connectionBearerToken: string | null) => {
 			wsInstance.on('unexpected-response', (_request, response) => {
 				let body = '';
 				response.on('data', (chunk: Buffer) => { body += chunk.toString(); });
@@ -933,7 +935,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				}
 				this.emit([this.helpers.returnJsonArray([{
 					event: 'open',
-					bearerToken: currentBearerToken || null,
+					bearerToken: connectionBearerToken,
 					ws: returnWs ? wsInstance : null,
 				}])]);
 				emitTokenRefreshed();
@@ -951,7 +953,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 				if (outgoingWs) silentCloseInstances.add(outgoingWs);
 
 				try {
-					const { url, headers } = await buildConnectionOptions(true);
+					const { url, headers, bearerToken } = await buildConnectionOptions(true);
 					const newWs = new WebSocket(url, { headers });
 
 					newWs.once('error', (error: Error) => {
@@ -965,7 +967,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 					newWs.once('open', () => {
 						console.debug('[websocket-ws] overlap new connection open, closing old');
 						ws = newWs;
-						setupWsEvents(newWs);
+						setupWsEvents(newWs, bearerToken);
 						if (outgoingWs) {
 							silentCloseInstances.add(outgoingWs); // ensure still marked
 							outgoingWs.terminate();
@@ -976,7 +978,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 						}
 						this.emit([this.helpers.returnJsonArray([{
 							event: 'open',
-							bearerToken: currentBearerToken || null,
+							bearerToken,
 							ws: returnWs ? newWs : null,
 						}])]);
 						emitTokenRefreshed();
@@ -1002,7 +1004,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const startConsumer = async (): Promise<void> => {
 			await runExclusiveConnectionFlow(async () => {
 				try {
-					const { url, headers } = await buildConnectionOptions();
+					const { url, headers, bearerToken } = await buildConnectionOptions();
 					emitDebug('wsHandshakePrepared', {
 						url: sanitizeUrlForDebug(url),
 						headerKeys: Object.keys(headers),
@@ -1012,7 +1014,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 							: null,
 					});
 					ws = new WebSocket(url, { headers });
-					setupWsEvents(ws);
+					setupWsEvents(ws, bearerToken);
 				} catch (error: unknown) {
 					const msg = error instanceof Error ? error.message : String(error);
 					throw new NodeOperationError(this.getNode(), `Execution error: ${msg}`);
