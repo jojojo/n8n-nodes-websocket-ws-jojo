@@ -680,6 +680,13 @@ export class WebsocketReconnectTrigger implements INodeType {
 				description: 'Whether to include the raw ws object in output (needed to send reply messages)',
 			},
 			{
+				displayName: 'Emit Lifecycle Events',
+				name: 'emitLifecycleEvents',
+				type: 'boolean',
+				default: true,
+				description: 'Whether to emit open, close, and tokenRefreshed events in addition to message events',
+			},
+			{
 				displayName: 'Debug Mode',
 				name: 'debugMode',
 				type: 'boolean',
@@ -702,6 +709,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const authentication         = this.getNodeParameter('authentication', 'none') as string;
 		const sendInitMessage        = this.getNodeParameter('sendInitMessage', false) as boolean;
 		const returnWs               = this.getNodeParameter('returnWs', false) as boolean;
+		const emitLifecycleEvents    = this.getNodeParameter('emitLifecycleEvents', true) as boolean;
 		const debugMode              = this.getNodeParameter('debugMode', false) as boolean;
 		const autoReconnect          = this.getNodeParameter('autoReconnect', true) as boolean;
 		const reconnectInterval      = (this.getNodeParameter('reconnectInterval', 10) as number) * 1000;
@@ -966,6 +974,7 @@ export class WebsocketReconnectTrigger implements INodeType {
 		const silentCloseInstances = new Set<WebSocket>();
 
 		const emitTokenRefreshed = () => {
+			if (!emitLifecycleEvents) return;
 			if (!currentBearerToken) return;
 			this.emit([this.helpers.returnJsonArray([{
 				event: 'tokenRefreshed',
@@ -1014,7 +1023,9 @@ export class WebsocketReconnectTrigger implements INodeType {
 				if (silentCloseInstances.has(wsInstance)) { silentCloseInstances.delete(wsInstance); return; }
 
 				console.debug('[websocket-ws] connection closed');
-				this.emit([this.helpers.returnJsonArray([{ event: 'close' }])]);
+				if (emitLifecycleEvents) {
+					this.emit([this.helpers.returnJsonArray([{ event: 'close' }])]);
+				}
 				if (refreshTimer) clearTimeout(refreshTimer);
 				if (isClosed) return;
 
@@ -1044,11 +1055,13 @@ export class WebsocketReconnectTrigger implements INodeType {
 				if (sendInitMessage) {
 					wsInstance.send(this.getNodeParameter('initMessage', '') as string);
 				}
-				this.emit([this.helpers.returnJsonArray([{
-					event: 'open',
-					bearerToken: connectionBearerToken,
-					ws: returnWs ? wsInstance : null,
-				}])]);
+				if (emitLifecycleEvents) {
+					this.emit([this.helpers.returnJsonArray([{
+						event: 'open',
+						bearerToken: connectionBearerToken,
+						ws: returnWs ? wsInstance : null,
+					}])]);
+				}
 				emitTokenRefreshed();
 				scheduleTokenRefresh();
 			});
@@ -1097,11 +1110,13 @@ export class WebsocketReconnectTrigger implements INodeType {
 						if (sendInitMessage) {
 							newWs.send(this.getNodeParameter('initMessage', '') as string);
 						}
-						this.emit([this.helpers.returnJsonArray([{
-							event: 'open',
-							bearerToken,
-							ws: returnWs ? newWs : null,
-						}])]);
+						if (emitLifecycleEvents) {
+							this.emit([this.helpers.returnJsonArray([{
+								event: 'open',
+								bearerToken,
+								ws: returnWs ? newWs : null,
+							}])]);
+						}
 						emitTokenRefreshed();
 						scheduleTokenRefresh();
 					});
