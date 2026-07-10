@@ -1,19 +1,19 @@
 {
-  "name": "n8n-nodes-websocket-ws-prueba",
+  "name": "n8n-nodes-websocket-ws-jojo",
   "version": "1.7.1",
   "description": "WebSocket trigger for n8n with header/query auth and auto-reconnect",
   "keywords": [
     "n8n-community-node-package"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/santi648/n8n-nodes-websocket-ws-prueba",
+  "homepage": "https://github.com/jojojojo/n8n-nodes-websocket-ws-jojo",
   "author": {
     "name": "santaigop",
     "email": "santiago.delavegavargas@gmail.com"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/santi648/n8n-nodes-websocket-ws-prueba"
+    "url": "https://github.com/jojojojo/n8n-nodes-websocket-ws-jojo.git"
   },
   "engines": {
     "node": ">=18.10",
